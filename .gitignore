@@ -1,0 +1,30 @@
+# =========================
+# Python & Cache
+# =========================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+
+# =========================
+# Environment Variables
+# =========================
+.env
+
+
+# =========================
+# User Data & Application State
+# =========================
+# User-uploaded PDFs
+uploads/
+
+# User configuration files
+configs/
+
+# =========================
+# Logging
+# =========================
+logs/
+*.log
+
