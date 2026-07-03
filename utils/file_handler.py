@@ -48,51 +48,6 @@ def write_text_safe(filepath: str, content: str, append: bool = False) -> None:
     with open(filepath, mode, encoding='utf-8') as file:
         file.write(content)
 
-
-def stream_text_by_chunks(filepath: str, chunk_size_mb: int = 50) -> Generator[str, None, None]:
-    """
-    Reads a massive file in fixed size memory blocks (default: 1 MB).
-    Best for raw speed when reading, copying, or regex scanning.
-    """
-    if not os.path.exists(filepath):
-        logger.warning(f"Text file not found for streaming: {filepath}. No data to yield.")
-        return
-
-    chunk_size_bytes = chunk_size_mb * 1024 * 1024
-
-    with open(filepath, 'r', encoding='utf-8') as file:
-        logger.info(f"Streaming text file in {chunk_size_mb} MB chunks: {filepath}")
-        while True:
-            chunk = file.read(chunk_size_bytes)
-            if not chunk:
-                break
-            yield chunk
-
-
-def stream_text_by_paragraphs(filepath: str) -> Generator[str, None, None]:
-    """
-    Reads a file and yields one complete paragraph at a time.
-    Best for Natural Language Processing (NLP) or summarizing articles.
-    """
-    if not os.path.exists(filepath):
-        logger.warning(f"Text file not found for paragraph streaming: {filepath}. No data to yield.")
-        return
-
-    with open(filepath, 'r', encoding='utf-8') as file:
-        paragraph = []
-        
-        for line in file:
-            if line.strip() == "":
-                if paragraph:
-                    yield "".join(paragraph).strip()
-                    paragraph = []
-            else:
-                paragraph.append(line)
-                
-        if paragraph:
-            yield "".join(paragraph).strip()
-
-
 # ==========================================
 # PDF FILE UTILITIES
 # ==========================================
