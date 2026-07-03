@@ -2,7 +2,7 @@ import logging
 import os
 import jwt
 import datetime
-from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Response, Request,Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Response, Request,Form,BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from pydantic import BaseModel
@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 from utils.logger import get_logger
 from utils.json_handler import *
 from utils.file_handler import *
-
+from utils.vdb_handler import embed_uploaded_file
 # Load environment variables (.env)
 load_dotenv()
 
@@ -28,7 +28,7 @@ app = FastAPI(title="Study Companion API")
 # Configure CORS so the Vite React frontend can communicate with FastAPI
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"], # Must match your exact frontend URL
+    allow_origins=["http://localhost:5173"], # Must match  exact frontend URL
     allow_credentials=True, # Required to send the secure HttpOnly cookie
     allow_methods=["*"],
     allow_headers=["*"],
@@ -101,6 +101,19 @@ async def login_with_google(token: str, response: Response):
     except Exception as e:
         logger.error(f"Login failed: {str(e)}")
         raise HTTPException(status_code=401, detail="Invalid Google token")
+
+@app.post("/login/logout")
+async def logout_user(response: Response):
+    """
+    Clears the HttpOnly cookie to securely log the user out.
+    """
+    response.delete_cookie(
+        "session_token", 
+        httponly=True, 
+        samesite="lax"
+    )
+    logger.info("User successfully logged out and cookie cleared.")
+    return {"message": "Logged out successfully"}
 
 @app.get("/auth/check")
 async def check_auth(user_id: str = Depends(get_current_user_from_cookie)):
@@ -181,6 +194,7 @@ async def get_full_config(user_id: str = Depends(get_current_user_from_cookie)):
 
 @app.post("/files/upload")
 async def upload_documents(
+    background_tasks: BackgroundTasks,
     files: List[UploadFile] = File(...),
     folder: str = Form(None), # Captures the subject name from the frontend
     user_id: str = Depends(get_current_user_from_cookie) 
@@ -236,13 +250,21 @@ async def upload_documents(
             
             saved_files.append(filepath)
             logger.info(f"Successfully saved {file.filename} for {user_id}")
+            # Schedule the embedding process in the background and send the response immediately to the frontend.
+            background_tasks.add_task(
+            embed_uploaded_file, 
+            filepath=filepath, 
+            user_id=user_id, 
+            subject=folder or "root", 
+            filename=file.filename
+        )
 
         except Exception as e:
             logger.exception(f"Failed to process file {file.filename} for {user_id}")
             failed_files.append(file.filename)
 
     return {
-        "message": f"Processed {len(files)} files for {user_id} into {folder or 'root'}.",
+        "message": f"Processed {len(files)} files for {user_id} into {folder or 'root'}. They are now processing",
         "saved_successfully": saved_files,
         "failed_to_save": failed_files
     }
