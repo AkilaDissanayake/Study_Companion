@@ -105,6 +105,7 @@ def embed_uploaded_file(filepath: str, user_id: str, subject: str, filename: str
             # Can avoid embedding duplicates if user changes doc and upload again its also handled.
 
         # Save to the USER'S specific Vector Database collection
+        #Used the default embedding model
         user_collection.upsert(
             documents=documents,
             metadatas=metadatas,

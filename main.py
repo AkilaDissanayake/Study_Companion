@@ -2,7 +2,7 @@ import logging
 import os
 import jwt
 import datetime
-from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Response, Request,Form,BackgroundTasks
+from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Response, Request,Form,BackgroundTasks,Query
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from pydantic import BaseModel
@@ -16,11 +16,16 @@ from utils.logger import get_logger
 from utils.json_handler import *
 from utils.file_handler import *
 from utils.vdb_handler import embed_uploaded_file
+from utils.database_handler import engine, Base,get_db
+from utils.db_models import TokenUsage, ChatSession 
+from models.chatbot import ChatBot
 # Load environment variables (.env)
 load_dotenv()
 
 # Initialize the isolated logger for this file
 logger = get_logger(__name__, "main.log")
+
+
 
 # Initialize FastAPI
 app = FastAPI(title="Study Companion API")
@@ -184,9 +189,6 @@ async def get_full_config(user_id: str = Depends(get_current_user_from_cookie)):
     # Returns the JSON file content, or an empty dict if not found
     return read_config(config_file, default_fallback={})
 
-# ==========================================
-# SECURE MULTIPLE FILE UPLOAD API
-# ==========================================
 
 # ==========================================
 # SECURE MULTIPLE FILE UPLOAD API
@@ -268,6 +270,92 @@ async def upload_documents(
         "saved_successfully": saved_files,
         "failed_to_save": failed_files
     }
+
+
+# ==========================================
+# API's to list and send files
+# ==========================================
+
+@app.get("/files/names")
+async def get_user_file_names(user_id: str = Depends(get_current_user_from_cookie)):
+    """
+    Retrieves ALL file names uploaded by a specific user.
+    Recursively scans the user's root upload folder and all subject subfolders.
+    """
+    # Define the absolute root of this user's storage
+    base_dir = f"uploads/{user_id}"
+    
+    # If the directory doesn't exist, they haven't uploaded anything yet
+    if not os.path.exists(base_dir):
+        return {
+            "user_id": user_id, 
+            "total_files": 0, 
+            "files": []
+        }
+
+    all_files = []
+
+    # os.walk looks at the current folder, then dives into every subfolder inside it
+    for root, dirs, files in os.walk(base_dir):
+        for file in files:
+            # Ignore hidden system files
+            if file.startswith("."):
+                continue
+                
+            # Determine which folder this file is sitting in (for UI categorization)
+            relative_path = os.path.relpath(root, base_dir)
+            folder_name = "root" if relative_path == "." else relative_path
+            
+            all_files.append({
+                "filename": file,
+                "subject": folder_name
+            })
+
+    return {
+        "user_id": user_id,
+        "total_files": len(all_files),
+        "files": all_files
+    }
+
+
+@app.get("/files/download")
+async def download_user_file(
+    filename: str = Query(..., description="The name of the file to download"),
+    subject: str = Query("root", description="The subject folder the file belongs to"),
+    user_id: str = Depends(get_current_user_from_cookie)
+):
+    """
+    Securely serves an uploaded file for viewing or downloading.
+    Prevents directory traversal attacks by reconstructing the path strictly within the user's directory.
+    """
+    # Reconstruct the base path based on whether the file is in a subject folder or root
+    if subject == "root":
+        file_path = os.path.join("uploads", user_id, filename)
+    else:
+        file_path = os.path.join("uploads", user_id, subject, filename)
+
+    # Security Check: Prevent directory traversal attacks (e.g., filename="../../../etc/passwd")
+    # This ensures the resolved path strictly stays inside the 'uploads' folder
+    normalized_path = os.path.normpath(file_path)
+    if not normalized_path.startswith("uploads"):
+        logger.warning(f"Security Alert: User {user_id} attempted directory traversal with path: {file_path}")
+        raise HTTPException(status_code=400, detail="Invalid file path sequence.")
+
+    # Check if the file actually exists on the server disk
+    if not os.path.exists(normalized_path) or os.path.isdir(normalized_path):
+        logger.warning(f"File not found on disk: {normalized_path} for user {user_id}")
+        raise HTTPException(status_code=404, detail="The requested file could not be found.")
+
+    logger.info(f"Serving file {filename} from subject '{subject}' to user {user_id}")
+
+    # Return the file using FileResponse
+    # media_type="application/octet-stream" forces a browser download dialog.
+    # filename=filename ensures the browser saves it with its original human-readable name.
+    return FileResponse(
+        path=normalized_path, 
+        media_type="application/octet-stream", 
+        filename=filename
+    )
 # ==========================================
 # SERVER EXECUTION
 # ==========================================
