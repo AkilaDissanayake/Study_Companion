@@ -118,3 +118,44 @@ def embed_uploaded_file(filepath: str, user_id: str, subject: str, filename: str
     except Exception as e:
         logger.exception(f"Failed to embed file {filename} for user {user_id}")
         return False
+def delete_file_from_vdb(user_id: str, filename: str,subject:str) -> bool:
+    """
+    Deletes all vector chunks associated with a specific filename 
+    from a user's dedicated ChromaDB collection.
+    """
+    try:
+        # 1. Identify the user's specific collection
+        safe_user_id = str(user_id).replace("-", "_")
+        collection_name = f"user_{safe_user_id}"
+        
+        # 2. Get the collection
+        user_collection = chroma_client.get_collection(name=collection_name)
+        
+        # 3. Delete all chunks where the filename matches
+        # This prevents 'ghost data' remaining in the vector store
+        user_collection.delete(where={"$and":[{"filename":filename},{"subject":subject}]})
+        
+        logger.info(f"Successfully removed all vector chunks for: {filename} from {collection_name}")
+        return True
+    except Exception as e:
+        logger.error(f"Error removing vectors for {filename}: {e}")
+        return False
+
+def delete_subject_from_vdb(user_id: str, subject: str) -> bool:
+    """
+    Deletes all vector chunks associated with a specific subject 
+    from a user's dedicated ChromaDB collection.
+    """
+    try:
+        safe_user_id = str(user_id).replace("-", "_")
+        collection_name = f"user_{safe_user_id}"
+        user_collection = chroma_client.get_collection(name=collection_name)
+        
+        # Filter by subject only
+        user_collection.delete(where={"subject": subject})
+        
+        logger.info(f"Successfully removed all vectors for subject: {subject} from {collection_name}")
+        return True
+    except Exception as e:
+        logger.error(f"Error removing vectors for subject {subject}: {e}")
+        return False

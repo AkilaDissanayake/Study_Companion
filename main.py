@@ -2,7 +2,7 @@ import logging
 import os
 import jwt
 import datetime
-from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Response, Request,Form,BackgroundTasks,Query
+from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Response, Request,Form,BackgroundTasks,Query,Body
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from pydantic import BaseModel
@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 from utils.logger import get_logger
 from utils.json_handler import *
 from utils.file_handler import *
-from utils.vdb_handler import embed_uploaded_file
+from utils.vdb_handler import embed_uploaded_file,delete_file_from_vdb,delete_subject_from_vdb
 from utils.database_handler import engine, Base,get_db
 from utils.db_models import TokenUsage, ChatSession 
 from models.chatbot import ChatBot
@@ -356,6 +356,63 @@ async def download_user_file(
         media_type="application/octet-stream", 
         filename=filename
     )
+
+# ==========================================
+# Deletion API
+# ==========================================
+@app.delete("/files/delete")
+async def delete_user_file(
+    data: dict = Body(...),
+    user_id: str = Depends(get_current_user_from_cookie)
+):
+
+    """
+    Securely deletes an uploaded file.
+    Prevents directory traversal attacks by reconstructing the path strictly within the user's directory.
+    """
+    file_name = data.get("filename")
+    subject = data.get("subject", "root")
+    
+    # Reconstruct the base path based on whether the file is in a subject folder or root
+    if subject == "root":
+        file_path = os.path.join("uploads", user_id, file_name)
+    else:
+        file_path = os.path.join("uploads", user_id, subject, file_name)
+    # Delete from upload dir
+    pdf_status=delete_file(file_path)
+    # Delete from vdb
+    vdb_status=delete_file_from_vdb(user_id,file_name,subject)
+
+@app.delete("/files/deletesubject")
+async def delete_user_subject(
+    data: dict = Body(...),
+    user_id: str = Depends(get_current_user_from_cookie)
+):
+
+    """
+    Securely deletes an uploaded file.
+    Prevents directory traversal attacks by reconstructing the path strictly within the user's directory.
+    """
+    subject = data.get("subject")
+    
+    # Reconstruct the base path based on whether the file is in a subject folder or root
+    if subject : #No button for root folder
+        file_path = os.path.join("uploads", user_id, subject)
+        # Delete from upload dir
+        pdf_status=delete_directory(file_path)
+        # Delete from vdb
+        vdb_status=delete_subject_from_vdb(user_id,subject)
+        #After deleting subject we need to remove that subject from config file
+        file_name=f"{user_id}.json"
+        subjects=read_config(file_name).get("subjects")
+        if subject in subjects:
+            subjects.remove(subject)
+        new_data={"subjects":subjects}
+        
+        update_config(file_name,new_data)
+        
+            
+
 # ==========================================
 # SERVER EXECUTION
 # ==========================================

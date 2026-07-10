@@ -1,4 +1,5 @@
 import os
+import shutil
 from utils.logger import get_logger
 from typing import Generator, Optional
 
@@ -83,3 +84,38 @@ def extract_pdf_text(filepath: str) -> Optional[str]:
     except Exception as e:
         logger.error(f"Error reading PDF: {e}")
         return None
+
+def delete_file(file_path: str) -> bool:
+    """
+    Safely deletes a file from the filesystem.
+    Returns True if successfully deleted or if the file didn't exist,
+    returns False if an error occurred during deletion.
+    """
+    try:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            logger.info(f"File successfully deleted: {file_path}")
+            return True
+        else:
+            logger.warning(f"Attempted to delete non-existent file: {file_path}")
+            # Returning True because the end goal (file not being there) is achieved
+            return True
+            
+    except Exception as e:
+        logger.error(f"Error deleting file {file_path}: {e}")
+        return False
+
+def delete_directory(directory_path: str) -> bool:
+    """
+    Safely deletes a directory and all its contents.
+    """
+    try:
+        if os.path.exists(directory_path):
+            shutil.rmtree(directory_path)
+            logger.info(f"Directory successfully deleted: {directory_path}")
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Error deleting directory {directory_path}: {e}")
+        return False
+    
