@@ -2,8 +2,10 @@ import logging
 import os
 import jwt
 import datetime
+import mimetypes
 from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Response, Request,Form,BackgroundTasks,Query,Body
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 import uvicorn
 from pydantic import BaseModel
 from typing import Dict, Any, List
@@ -310,7 +312,7 @@ async def get_user_file_names(user_id: str = Depends(get_current_user_from_cooki
                 "filename": file,
                 "subject": folder_name
             })
-
+            print(all_files)
     return {
         "user_id": user_id,
         "total_files": len(all_files),
@@ -320,12 +322,12 @@ async def get_user_file_names(user_id: str = Depends(get_current_user_from_cooki
 
 @app.get("/files/download")
 async def download_user_file(
-    filename: str = Query(..., description="The name of the file to download"),
+    filename: str = Query(..., description="The name of the file to download or preview"),
     subject: str = Query("root", description="The subject folder the file belongs to"),
     user_id: str = Depends(get_current_user_from_cookie)
 ):
     """
-    Securely serves an uploaded file for viewing or downloading.
+    Securely serves an uploaded file for viewing (inline) or downloading.
     Prevents directory traversal attacks by reconstructing the path strictly within the user's directory.
     """
     # Reconstruct the base path based on whether the file is in a subject folder or root
@@ -346,15 +348,20 @@ async def download_user_file(
         logger.warning(f"File not found on disk: {normalized_path} for user {user_id}")
         raise HTTPException(status_code=404, detail="The requested file could not be found.")
 
-    logger.info(f"Serving file {filename} from subject '{subject}' to user {user_id}")
+    logger.info(f"Serving file {filename} from subject '{subject}' to user {user_id} for preview")
+
+    # 1. Guess the correct media type based on the file extension (e.g., 'application/pdf', 'image/jpeg')
+    content_type, _ = mimetypes.guess_type(normalized_path)
 
     # Return the file using FileResponse
-    # media_type="application/octet-stream" forces a browser download dialog.
-    # filename=filename ensures the browser saves it with its original human-readable name.
+    # media_type uses the guessed type so the browser knows how to render it (PDF, images, etc.).
+    # content_disposition_type="inline" tells the browser to display it in the iframe/window instead of downloading.
+    # filename=filename ensures that if the user clicks "Save As" from the preview, it still has the right name.
     return FileResponse(
         path=normalized_path, 
-        media_type="application/octet-stream", 
-        filename=filename
+        media_type=content_type or "application/octet-stream", 
+        filename=filename,
+        content_disposition_type="inline"
     )
 
 # ==========================================
