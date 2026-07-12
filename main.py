@@ -403,7 +403,7 @@ async def delete_user_subject(
     subject = data.get("subject")
     
     # Reconstruct the base path based on whether the file is in a subject folder or root
-    if subject : #No button for root folder
+    if subject!="root" : #No button for root folder
         file_path = os.path.join("uploads", user_id, subject)
         # Delete from upload dir
         pdf_status=delete_directory(file_path)
@@ -418,7 +418,13 @@ async def delete_user_subject(
         
         update_config(file_name,new_data)
         
-            
+    else:
+        
+        file_path=os.path.join("uploads",user_id)
+        pdf_status=delete_directory(file_path)
+        # Delete from vdb
+        vdb_status=delete_subject_from_vdb(user_id,"root")
+
 
 # ==========================================
 # SERVER EXECUTION
