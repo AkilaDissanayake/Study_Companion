@@ -5,8 +5,12 @@ Token Metrics Management Utilities.
 Provides internal backend operations responsible for handling resource accounting data, 
 ensuring database write tasks are decoupled securely from primary application threads.
 """
-from utils.database_handler import SessionLocal
+from utils.database_handler import SessionLocal #have to manage manually since this is not a FastAPI endpoint context
 from utils.db_models import TokenUsage
+from utils.logger import get_logger
+
+logger = get_logger(__name__, "token_usage.log")
+
 
 def log_token_usage(user_id: str, model_name: str, prompt_tokens: int, completion_tokens: int):
     """
@@ -36,7 +40,7 @@ def log_token_usage(user_id: str, model_name: str, prompt_tokens: int, completio
         # Rollback the session state immediately if database locks or exceptions happen
         db.rollback()
         # Fall back to console/app logging so engineering teams can inspect failures
-        print(f"Failed to log token metrics to DB: {str(e)}")
+        logger.error(f"Failed to log token metrics to DB: {str(e)}")
     finally:
         # Always terminate the session connection back into the Pool
         db.close()
