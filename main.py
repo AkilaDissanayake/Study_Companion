@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 import uvicorn
 from pydantic import BaseModel
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from google.oauth2 import id_token
 from google.auth.transport import requests
 from dotenv import load_dotenv
@@ -19,7 +19,8 @@ from utils.json_handler import *
 from utils.file_handler import *
 from utils.vdb_handler import embed_uploaded_file,delete_file_from_vdb,delete_subject_from_vdb
 from utils.database_handler import engine, Base,get_db
-from utils.db_models import TokenUsage, ChatSession 
+from utils.db_models import TokenUsage, ChatSession
+from utils.response_handler import success_response, raise_api_error 
 from models.chatbot import ChatBot
 # Load environment variables (.env)
 load_dotenv()
@@ -47,6 +48,12 @@ logger.info("FastAPI application successfully started.")
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", "super-secret-key-change-me")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 
+#Classes
+class ChatRequest(BaseModel):
+    """The expected JSON payload from the React frontend."""
+    raw_question: str
+    chat_history: Optional[str] = ""
+
 # ==========================================
 # AUTHENTICATION & JWT LOGIC
 # ==========================================
@@ -57,7 +64,7 @@ async def get_current_user_from_cookie(request: Request) -> str:
     
     if not token:
         logger.warning("Rejected request: Missing session token cookie.")
-        raise HTTPException(status_code=401, detail="Not authenticated")
+        raise_api_error(status_code=401, message="Not authenticated. Missing session token.")
         
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
@@ -65,10 +72,10 @@ async def get_current_user_from_cookie(request: Request) -> str:
         
     except jwt.ExpiredSignatureError:
         logger.warning("Rejected request: Session token expired.")
-        raise HTTPException(status_code=401, detail="Token expired")
+        raise_api_error(status_code=401, message="Session token has expired. Please log in again.")
     except jwt.InvalidTokenError:
         logger.error("Rejected request: Invalid or tampered token detected.")
-        raise HTTPException(status_code=401, detail="Invalid token")
+        raise_api_error(status_code=401, message="Invalid or tampered token detected.")
 
 
 @app.post("/login/google")
@@ -100,14 +107,13 @@ async def login_with_google(token: str, response: Response):
         )
         
         logger.info(f"User {user_id} successfully logged in.")
-        return {
-            "user_id": user_id,
-            "config": user_config
-        }
+        return success_response(
+            message="Login successful", 
+            data={"user_id": user_id, "config": user_config}
+        )
         
     except Exception as e:
-        logger.error(f"Login failed: {str(e)}")
-        raise HTTPException(status_code=401, detail="Invalid Google token")
+        raise_api_error(status_code=401, message="Invalid Google token", error_details=e)
 
 @app.post("/login/logout")
 async def logout_user(response: Response):
@@ -120,7 +126,7 @@ async def logout_user(response: Response):
         samesite="lax"
     )
     logger.info("User successfully logged out and cookie cleared.")
-    return {"message": "Logged out successfully"}
+    return success_response(message="Logged out successfully")
 
 @app.get("/auth/check")
 async def check_auth(user_id: str = Depends(get_current_user_from_cookie)):
@@ -149,11 +155,11 @@ async def create_config(
         logger.debug(f"User {user_id} attempting to create config: {payload.filename}")
         write_config(payload.filename, payload.data)
         logger.info(f"Successfully created config: {payload.filename}")
-        return {"message": f"Config {payload.filename} created successfully."}
+        return success_response(message=f"Config {payload.filename} created successfully.")
     
     except Exception as e:
         logger.exception(f"Failed to create config {payload.filename}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise_api_error(status_code=500, message=f"Failed to create config {payload.filename}", error_details=e)
 
 
 @app.patch("/config/edit")
@@ -165,11 +171,11 @@ async def edit_existing_config(
         logger.debug(f"User {user_id} attempting to update config: {payload.filename}")
         update_config(payload.filename, payload.data)
         logger.info(f"Successfully updated config: {payload.filename}")
-        return {"message": f"Config {payload.filename} updated successfully."}
+        return success_response(message=f"Config {payload.filename} updated successfully.")
         
     except Exception as e:
         logger.exception(f"Failed to update config {payload.filename}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise_api_error(status_code=500, message=f"Failed to update config {payload.filename}", error_details=e)
 
 @app.get("/config/subjects")
 async def view_config(user_id: str = Depends(get_current_user_from_cookie)):
@@ -179,17 +185,18 @@ async def view_config(user_id: str = Depends(get_current_user_from_cookie)):
         user_config = read_config(config_file, default_fallback={})
         logger.debug(f"User {user_id} retrieved their config.")
         subjects = list(user_config.get("subjects", []))
-        return {"subjects": subjects}
+        return success_response(message="Subjects retrieved", data={"subjects": subjects})
     except Exception as e:
         logger.exception(f"Failed to retrieve config for user {user_id}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise_api_error(status_code=500, message="Failed to retrieve config", error_details=e)
 
 @app.get("/config/get")
 async def get_full_config(user_id: str = Depends(get_current_user_from_cookie)):
     """Endpoint to return the full user configuration."""
     config_file = f"{user_id}.json"
     # Returns the JSON file content, or an empty dict if not found
-    return read_config(config_file, default_fallback={})
+    config_data = read_config(config_file, default_fallback={})
+    return success_response(message="Config retrieved", data=config_data)
 
 
 # ==========================================
@@ -267,11 +274,10 @@ async def upload_documents(
             logger.exception(f"Failed to process file {file.filename} for {user_id}")
             failed_files.append(file.filename)
 
-    return {
-        "message": f"Processed {len(files)} files for {user_id} into {folder or 'root'}. They are now processing",
-        "saved_successfully": saved_files,
-        "failed_to_save": failed_files
-    }
+    return success_response(
+        message=f"Processed {len(files)} files into {folder or 'root'}.",
+        data={"saved_successfully": saved_files, "failed_to_save": failed_files}
+    )
 
 
 # ==========================================
@@ -313,11 +319,10 @@ async def get_user_file_names(user_id: str = Depends(get_current_user_from_cooki
                 "subject": folder_name
             })
             print(all_files)
-    return {
-        "user_id": user_id,
-        "total_files": len(all_files),
-        "files": all_files
-    }
+    return success_response(
+        message="Files retrieved successfully",
+        data={"total_files": len(all_files), "files": all_files}
+    )
 
 
 @app.get("/files/download")
@@ -340,13 +345,13 @@ async def download_user_file(
     # This ensures the resolved path strictly stays inside the 'uploads' folder
     normalized_path = os.path.normpath(file_path)
     if not normalized_path.startswith("uploads"):
-        logger.warning(f"Security Alert: User {user_id} attempted directory traversal with path: {file_path}")
-        raise HTTPException(status_code=400, detail="Invalid file path sequence.")
+
+        raise_api_error(status_code=400, message="Security Alert: Invalid file path sequence.")
 
     # Check if the file actually exists on the server disk
     if not os.path.exists(normalized_path) or os.path.isdir(normalized_path):
-        logger.warning(f"File not found on disk: {normalized_path} for user {user_id}")
-        raise HTTPException(status_code=404, detail="The requested file could not be found.")
+    
+        raise_api_error(status_code=404, message="The requested file could not be found.")
 
     logger.info(f"Serving file {filename} from subject '{subject}' to user {user_id} for preview")
 
@@ -377,18 +382,23 @@ async def delete_user_file(
     Securely deletes an uploaded file.
     Prevents directory traversal attacks by reconstructing the path strictly within the user's directory.
     """
-    file_name = data.get("filename")
-    subject = data.get("subject", "root")
-    
-    # Reconstruct the base path based on whether the file is in a subject folder or root
-    if subject == "root":
-        file_path = os.path.join("uploads", user_id, file_name)
-    else:
-        file_path = os.path.join("uploads", user_id, subject, file_name)
-    # Delete from upload dir
-    pdf_status=delete_file(file_path)
-    # Delete from vdb
-    vdb_status=delete_file_from_vdb(user_id,file_name,subject)
+    try:
+        file_name = data.get("filename")
+        subject = data.get("subject", "root")
+        
+        # Reconstruct the base path based on whether the file is in a subject folder or root
+        if subject == "root":
+            file_path = os.path.join("uploads", user_id, file_name)
+        else:
+            file_path = os.path.join("uploads", user_id, subject, file_name)
+        # Delete from upload dir
+        pdf_status=delete_file(file_path)
+        # Delete from vdb
+        vdb_status=delete_file_from_vdb(user_id,file_name,subject)
+
+        return success_response(message=f"File {file_name} successfully deleted.") #check
+    except Exception as e:
+        raise_api_error(status_code=500, message="Failed to delete file", error_details=e)
 
 @app.delete("/files/deletesubject")
 async def delete_user_subject(
@@ -400,30 +410,90 @@ async def delete_user_subject(
     Securely deletes an uploaded file.
     Prevents directory traversal attacks by reconstructing the path strictly within the user's directory.
     """
-    subject = data.get("subject")
-    
-    # Reconstruct the base path based on whether the file is in a subject folder or root
-    if subject!="root" : #No button for root folder
-        file_path = os.path.join("uploads", user_id, subject)
-        # Delete from upload dir
-        pdf_status=delete_directory(file_path)
-        # Delete from vdb
-        vdb_status=delete_subject_from_vdb(user_id,subject)
-        #After deleting subject we need to remove that subject from config file
-        file_name=f"{user_id}.json"
-        subjects=read_config(file_name).get("subjects")
-        if subject in subjects:
-            subjects.remove(subject)
-        new_data={"subjects":subjects}
+    try:
+        subject = data.get("subject")
         
-        update_config(file_name,new_data)
+        # Reconstruct the base path based on whether the file is in a subject folder or root
+        if subject!="root" : #No button for root folder
+            file_path = os.path.join("uploads", user_id, subject)
+            # Delete from upload dir
+            pdf_status=delete_directory(file_path)
+            # Delete from vdb
+            vdb_status=delete_subject_from_vdb(user_id,subject)
+            #After deleting subject we need to remove that subject from config file
+            file_name=f"{user_id}.json"
+            subjects=read_config(file_name).get("subjects")
+            if subject in subjects:
+                subjects.remove(subject)
+            new_data={"subjects":subjects}
+            
+            update_config(file_name,new_data)
+            
+        else:
+            
+            file_path=os.path.join("uploads",user_id)
+            pdf_status=delete_directory(file_path)
+            # Delete from vdb
+            vdb_status=delete_subject_from_vdb(user_id,"root")
+        return success_response(message=f"Subject '{subject}' successfully deleted.")
+    except Exception as e:
+        raise_api_error(status_code=500, message="Failed to delete subject", error_details=e)
+
+
+# ==========================================
+# Chat API
+# ==========================================
+@app.post("/chat")
+async def chat_endpoint(
+    request: ChatRequest, 
+    user_id: str = Depends(get_current_user_from_cookie)
+):
+    """
+    Main endpoint that triggers the Adaptive CRAG LangGraph state machine.
+    """
+    try:
+        logger.info(f"Received query from user {user_id}: {request.raw_question[:50]}...")
         
-    else:
+        # 1. Initialize the starting state for LangGraph
+        # We only need to provide the initial inputs. The graph will populate the rest.
+        initial_state = {
+            "user_id": user_id,
+            "raw_question": request.raw_question,
+            "chat_history": request.chat_history,
+        }
         
-        file_path=os.path.join("uploads",user_id)
-        pdf_status=delete_directory(file_path)
-        # Delete from vdb
-        vdb_status=delete_subject_from_vdb(user_id,"root")
+        # 2. Execute the Graph
+        # .invoke() runs the state machine synchronously from start to finish
+        final_state = ChatBot.invoke(initial_state)
+        
+        # 3. Extract the outputs safely using .get()
+        response_text = final_state.get("final_response", "Error: No response generated.")
+        
+        crag_status = final_state.get("status", "BYPASSED_CRAG") 
+        confidence = final_state.get("confidence_score", 0.0)
+        used_tools = final_state.get("needs_tools", False)
+        subject = final_state.get("subject", "Unknown")
+        detail_level = final_state.get("detail_level", "Unknown")
+        
+        logger.info(f"Successfully generated response for user {user_id}. Status: {crag_status}")
+        
+        # PACKAGE THE DATA INTO A DICTIONARY FIRST
+        chat_data = {
+            "response": response_text,
+            "status": crag_status,
+            "confidence": confidence,
+            "used_tools": used_tools,
+            "subject": subject,
+            "detail_level": detail_level
+        }
+        
+        
+        # Return the structured JSON to the frontend
+        return success_response(message="Chat generated successfully", data=chat_data)
+        
+    except Exception as e:
+        # USE RAISE_API_ERROR HERE:
+        raise_api_error(status_code=500, message="Internal Server Error during LangGraph execution.", error_details=e)
 
 
 # ==========================================
