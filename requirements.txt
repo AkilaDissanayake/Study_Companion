@@ -1,6 +1,33 @@
+# --- Core API & Server ---
 fastapi
 uvicorn
 python-multipart
 pydantic
 python-dotenv
+
+# --- Authentication & Security ---
+google-auth
+requests
+PyJWT
+
+# --- File Processing ---
 PyPDF2
+
+# --- Database & ORM ---
+sqlalchemy
+psycopg2-binary
+chromadb
+
+# --- AI, LLMs & LangGraph ---
+langgraph
+langchain-core
+langchain-community
+langchain-openai
+langchain-text-splitters
+
+# --- Local Models (Cross-Encoders) ---
+sentence-transformers
+
+# --- Search Internet ---
+duckduckgo-search
+ddgs
