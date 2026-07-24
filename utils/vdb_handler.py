@@ -162,42 +162,35 @@ def delete_subject_from_vdb(user_id: str, subject: str) -> bool:
         return False
 
 def search_vdb(user_id: str, subject: str, query: str, k: int = 10) -> List[str]:
-    """
-    Retrieves the top-k most relevant text chunks from the user's collection.
-    
-    Args:
-        user_id (str): The unique identifier for the user.
-        subject (str): The specific subject to filter by (e.g., 'Biology').
-        query (str): The rewritten user question.
-        k (int): Number of initial chunks to retrieve. Set high (10) because 
-                 the CRAG Grader node will aggressively filter them down.
-                 
-    Returns:
-        List[str]: A list of raw text chunks. Returns empty list if none found.
-    """
+    """Retrieves the top-k most relevant text chunks from the user's collection."""
     try:
         safe_user_id = str(user_id).replace("-", "_")
         collection_name = f"user_{safe_user_id}"
         
-        # 1. Safely attempt to get the user's collection
         try:
             user_collection = chroma_client.get_collection(name=collection_name)
         except Exception:
-            logger.warning(f"Collection {collection_name} does not exist. User likely hasn't uploaded documents yet.")
+            logger.warning(f"Collection {collection_name} does not exist.")
             return []
-            
-        # 2. Query ChromaDB with Metadata Filtering
-        # We enforce a strict WHERE clause so the DB only searches the active subject.
+
+        if user_collection.count() == 0:
+            logger.info(f"Collection {collection_name} is empty.")
+            return []
+
+        
+        # But if you only want to search the un-foldered files, keep it strictly mapped:
+        #where_clause = {"subject": subject} 
+        
+        #Since root llm outputs root for subjects it cant identify we search all subjects if the subject is root, otherwise we filter by subject
+        where_clause = None if subject == "root" else {"subject": subject}
+
         results = user_collection.query(
             query_texts=[query],
-            n_results=k,
-            where={"subject": subject}
+            n_results=min(k, user_collection.count()),
+            where=where_clause
         )
         
-        # 3. Extract the documents
-        # ChromaDB returns a list of lists for 'documents': e.g., [['chunk1', 'chunk2', ...]]
         documents = results.get("documents", [[]])[0]
-        
         logger.info(f"Retrieved {len(documents)} chunks from VDB for query: '{query[:30]}...'")
         return documents
         
