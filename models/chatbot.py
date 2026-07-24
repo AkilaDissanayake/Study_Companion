@@ -17,10 +17,12 @@ from sentence_transformers import CrossEncoder
 from langchain_community.tools import DuckDuckGoSearchRun
 from utils.vdb_handler import search_vdb
 from utils.tools import tools
+from utils.json_handler import read_config
 from utils.prompts import (
     REWRITER_PROMPT, 
     CLASSIFIER_PROMPT, 
     SAFETY_PROMPT, 
+    DOMAIN_TUTOR_PROMPT,
     COMPOSER_PROMPT
 )
 from utils.token_manager import log_token_usage
@@ -64,7 +66,7 @@ class AgentState(TypedDict):
     subject: str
     detail_level: str
     needs_tools: bool
-    needs_documents;bool
+    needs_documents:bool
     is_safe: bool
     safety_reason: str
     
@@ -89,6 +91,8 @@ heavy_llm = ChatOpenAI(model="gpt-4o", temperature=0.7)
 # --- Node Definitions ---
 
 def rewrite_node(state: AgentState):
+
+    logger.info(f"Rewriting user question for clarity: {state['raw_question']}")
     tracker = TokenTrackingCallbackHandler(state["user_id"], "gpt-4o-mini-rewriter")
     chain = REWRITER_PROMPT | fast_llm.with_config({"callbacks": [tracker]})
     
@@ -96,17 +100,42 @@ def rewrite_node(state: AgentState):
         "chat_history": state.get("chat_history", ""),
         "raw_question": state["raw_question"]
     })
+    logger.debug(f"Rewritten question: {response.content}")
     return {"rewritten_question": response.content}
 
 
 def classify_node(state: AgentState):
+    logger.info(f"Classifying user question.")
     tracker = TokenTrackingCallbackHandler(state["user_id"], "gpt-4o-mini-classifier")
     llm_json = fast_llm.bind(response_format={"type": "json_object"}).with_config({"callbacks": [tracker]})
     chain = CLASSIFIER_PROMPT | llm_json
     
-    response = chain.invoke({"rewritten_question": state["rewritten_question"]})
+    #Get the subject list
+    user_id = state["user_id"]
+    config_file = f"{user_id}.json"
+    user_config = read_config(config_file, default_fallback={})
+    subjects = list(user_config.get("subjects", []))
+
+    if "General" not in subjects:
+        subjects.append("General")
+        
+    subjects_string = ", ".join(subjects)
+    # dynamically pull the names and descriptions of your actual tools!
+    if tools:
+        tools_desc = "\n".join([f"- {tool.name}: {tool.description}" for tool in tools])
+    else:
+        tools_desc = "No external tools currently available."
+    
+    # Inject both the question AND the tool list into the prompt
+    response = chain.invoke({
+        "rewritten_question": state["rewritten_question"],
+        "tools_description": tools_desc,
+        "available_subjects": subjects_string
+    })
+    
     try:
         data = json.loads(response.content)
+        logger.debug(f"Classification result: {data}")
         return {
             "subject": data.get("subject", "General"),
             "detail_level": data.get("detail_level", "concise"),
@@ -114,10 +143,12 @@ def classify_node(state: AgentState):
             "needs_documents": data.get("needs_documents", True)
         }
     except json.JSONDecodeError:
-        return {"subject": "General", "detail_level": "detailed", "needs_tools": False}
+        return {"subject": "General", "detail_level": "detailed", "needs_tools": False, "needs_documents": True}
 
 
 def safety_node(state: AgentState):
+
+    logger.info(f"Performing safety check on question")
     tracker = TokenTrackingCallbackHandler(state["user_id"], "gpt-4o-mini-safety")
     llm_json = fast_llm.bind(response_format={"type": "json_object"}).with_config({"callbacks": [tracker]})
     chain = SAFETY_PROMPT | llm_json
@@ -125,6 +156,7 @@ def safety_node(state: AgentState):
     response = chain.invoke({"rewritten_question": state["rewritten_question"]})
     try:
         data = json.loads(response.content)
+        logger.debug(f"Safety check result: {data}")
         return {
             "is_safe": data.get("is_safe", True),
             "safety_reason": data.get("reason", "safe")
@@ -136,17 +168,24 @@ def safety_node(state: AgentState):
 def retrieval_node(state: AgentState):
     """Pulls raw context chunks from the Vector DB."""
     
+    logger.info(f"Retrieving context from Vector DB for question")
+    if state.get("subject") == "General":
+        logger.warning("Subject is 'General'; retrieval may yield broad results.")
+        state["subject"] = "root"  # Ensure we have a default subject for the DB query
     res = search_vdb(
         user_id=state["user_id"], 
         subject=state["subject"], 
         query=state["rewritten_question"]
     )
     chunks = res if isinstance(res, list) else [res] if res else []
+    logger.debug(f"Retrieved chunks: {chunks}")
     return {"retrieved_chunks": chunks}
 
 
 def grade_context_node(state: AgentState):
     """Full CRAG Evaluator: Implements the 3-tier Correct/Ambiguous/Incorrect logic."""
+
+    logger.info(f"Grading retrieved context")
     query = state['rewritten_question']
     raw_chunks = state.get('retrieved_chunks', [])
     
@@ -171,7 +210,7 @@ def grade_context_node(state: AgentState):
         # Keep chunks that have at least some relevance (Ambiguous or Correct)
         if confidence >= 30.0:
             filtered_chunks.append(chunk)
-    
+    logger.debug(f"Filtered chunks: {filtered_chunks} with max confidence score: {max_score}")
     # 3-Tier CRAG Decision Gate
     if max_score >= 80.0:
         status = "CORRECT"
@@ -195,7 +234,8 @@ def grade_context_node(state: AgentState):
 
 def web_search_node(state: AgentState):
     """CRAG Fallback: Fetches and refines external knowledge when the database fails."""
-    from langchain_community.tools import DuckDuckGoSearchRun
+
+    logger.info(f"Performing external web search for question")
     search_tool = DuckDuckGoSearchRun()
     
     query = state["rewritten_question"]
@@ -214,7 +254,7 @@ def web_search_node(state: AgentState):
         # DuckDuckGo strings are usually separated by '...' or newlines. We split them into chunks.
         web_snippets = raw_web_results.split("...")
         refined_snippets = []
-        
+        logger.debug(f"Raw web snippets: {web_snippets}")
         for snippet in web_snippets:
             if len(snippet.strip()) < 15:
                 continue  # Skip empty or tiny fragments
@@ -258,31 +298,75 @@ def web_search_node(state: AgentState):
 
 def domain_tutor_node(state: AgentState):
     """Generates the educational answer based on the refined CRAG context."""
+    logger.info(f"Generating educational answer for question: {state['rewritten_question']}")
     tracker = TokenTrackingCallbackHandler(state["user_id"], "gpt-4o-mini-tutor")
+    
+    # Bind the tracker to the LLM
     llm_tracked = tutor_llm.with_config({"callbacks": [tracker]})
     
-    prompt = f"""
-    Use the following retrieved context to answer the student's question accurately.
-    Context: {state.get('context', 'No context available.')}
+    # Chain the prompt and the LLM together
+    chain = DOMAIN_TUTOR_PROMPT | llm_tracked
     
-    Question: Provide a {state.get('detail_level', 'detailed')} explanation for this {state.get('subject', 'General')} topic: {state.get('rewritten_question')}
-    """
+    # Invoke the chain by passing the state variables as a dictionary
+    response = chain.invoke({
+        "context": state.get('context', 'No context available.'),
+        "detail_level": state.get('detail_level', 'detailed'),
+        "subject": state.get('subject', 'General'),
+        "rewritten_question": state.get('rewritten_question', '')
+    })
     
-    response = llm_tracked.invoke(prompt)
     return {"raw_data": response.content}
 
 
 def tool_execution_node(state: AgentState):
+    logger.info(f"Executing external tools for question: {state['rewritten_question']}")
     tracker = TokenTrackingCallbackHandler(state["user_id"], "gpt-4o-tools")
-    cloud_with_tools = heavy_llm.bind_tools(tools).with_config({"callbacks": [tracker]})
+    llm_with_tools = heavy_llm.bind_tools(tools).with_config({"callbacks": [tracker]})
     
-    response = cloud_with_tools.invoke(state["rewritten_question"])
-    raw_output = response.content if response.content else str(response.tool_calls)
-    return {"raw_data": raw_output}
+    # Ask the LLM which tool it wants to run and with what arguments
+    #LangChain automatically takes the names and descriptions of  Python functions, turns them into a massive JSON schema
+    response = llm_with_tools.invoke(state["rewritten_question"])
+    
+    # If the LLM decided it didn't need a tool after all and just answered
+    if not response.tool_calls:
+        logger.info("LLM decided not to use a tool and provided a direct response.")
+        return {"raw_data": response.content}
+        
+    #  Create a dictionary to easily look up our actual Python tool functions by name
+    tool_map = {tool.name: tool for tool in tools}
+    
+    tool_outputs = []
+    
+    #  Iterate over the tools the LLM selected and actually execute them
+    for tool_call in response.tool_calls:
+        tool_name = tool_call["name"]
+        tool_args = tool_call["args"]
+        
+        logger.info(f"Executing tool: {tool_name} with args: {tool_args}")
+        
+        if tool_name in tool_map:
+            try:
+                # EXECUTION HAPPENS HERE: We invoke the actual LangChain tool
+                result = tool_map[tool_name].invoke(tool_args)
+                tool_outputs.append(f"[Output from {tool_name}]:\n{result}")
+                logger.info(f"Tool {tool_name} executed successfully.")
+            except Exception as e:
+                logger.error(f"Tool {tool_name} execution failed: {e}")
+                tool_outputs.append(f"[Error from {tool_name}]:\nExecution failed - {e}")
+        else:
+            logger.warning(f"LLM tried to call a non-existent tool: {tool_name}")
+            tool_outputs.append(f"[Error]: Tool '{tool_name}' does not exist.")
+            
+    #  Combine the results of all executed tools into a single string for the Composer
+    final_raw_output = "\n\n".join(tool_outputs)
+    
+    return {"raw_data": final_raw_output}
 
 
 def answer_composer_node(state: AgentState):
     """Formats the final text and handles apologies if all data retrievals failed."""
+
+    logger.info(f"Composing final answer for question: {state['rewritten_question']}")
     if not state.get("is_safe", True):
         override_data = f"Safety Violation Flagged: {state.get('safety_reason')}. Reject the request respectfully."
         
@@ -300,12 +384,16 @@ def answer_composer_node(state: AgentState):
         "raw_data": override_data,
         "rewritten_question": state["rewritten_question"]
     })
+    logger.info(f"Final answer generated: {response.content}")
     return {"final_response": response.content}
 
 
 # --- Routing Edge Logic ---
 
 def route_safety(state: AgentState):
+    """Decides if we need to bypass the database and go straight to tools or answer composition."""
+
+    logger.info(f"Routing after safety check: is_safe={state.get('is_safe')}, needs_tools={state.get('needs_tools')}, needs_documents={state.get('needs_documents')}")
     if not state.get("is_safe", True):
         return "answer_composer"
     if state.get("needs_tools") and not state.get("needs_documents"):
@@ -314,6 +402,8 @@ def route_safety(state: AgentState):
 
 def route_after_grading(state: AgentState):
     """Decides if we need to supplement/replace the database with a Web Search."""
+
+    logger.info(f"Routing after context grading: status={state.get('status')}, needs_tools={state.get('needs_tools')}")
     status = state.get("status", "INCORRECT")
     
     # If the database was INCORRECT or AMBIGUOUS, hit the web
@@ -327,6 +417,8 @@ def route_after_grading(state: AgentState):
 
 def route_execution(state: AgentState):
     """Directs traffic to tools or tutor after contexts are finalized."""
+
+    logger.info(f"Routing after context finalization: needs_tools={state.get('needs_tools')}")
     if state.get("needs_tools"):
         return "tool_execution"
     return "domain_tutor"
@@ -335,7 +427,7 @@ def route_execution(state: AgentState):
 # --- Workflow Graph Orchestration ---
 workflow = StateGraph(AgentState)
 
-# 1. Register all nodes
+#  Register all nodes
 workflow.add_node("rewriter", rewrite_node)
 workflow.add_node("classifier", classify_node)
 workflow.add_node("safety", safety_node)
@@ -346,12 +438,12 @@ workflow.add_node("tool_execution", tool_execution_node)
 workflow.add_node("domain_tutor", domain_tutor_node)
 workflow.add_node("answer_composer", answer_composer_node)
 
-# 2. Linear Entry Flow
+# Linear Entry Flow
 workflow.set_entry_point("rewriter")
 workflow.add_edge("rewriter", "classifier")
 workflow.add_edge("classifier", "safety")
 
-# 3. Safety Check Router
+#  Safety Check Router
 workflow.add_conditional_edges(
     "safety",
     route_safety,
@@ -364,7 +456,7 @@ workflow.add_conditional_edges(
 
 workflow.add_edge("retrieval_node", "grader_node")
 
-# 4. CRAG Router
+#  CRAG Router
 workflow.add_conditional_edges(
     "grader_node",
     route_after_grading,
@@ -375,7 +467,7 @@ workflow.add_conditional_edges(
     }
 )
 
-# 5. Post-Web Search Router
+#  Post-Web Search Router
 workflow.add_conditional_edges(
     "web_search_node",
     route_execution,
@@ -385,7 +477,7 @@ workflow.add_conditional_edges(
     }
 )
 
-# 6. Convergence
+#  Convergence
 workflow.add_edge("tool_execution", "answer_composer")
 workflow.add_edge("domain_tutor", "answer_composer")
 workflow.add_edge("answer_composer", END)
