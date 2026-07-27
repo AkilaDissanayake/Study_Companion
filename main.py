@@ -12,6 +12,8 @@ from typing import Dict, Any, List, Optional
 from google.oauth2 import id_token
 from google.auth.transport import requests
 from dotenv import load_dotenv
+from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 # Import custom utilities
 from utils.logger import get_logger
@@ -21,9 +23,16 @@ from utils.vdb_handler import embed_uploaded_file,delete_file_from_vdb,delete_su
 from utils.database_handler import engine, Base,get_db
 from utils.db_models import TokenUsage, ChatSession
 from utils.response_handler import success_response, raise_api_error 
+from utils.database_handler import engine, Base
+from utils import db_models 
 from models.chatbot import ChatBot
 # Load environment variables (.env)
 load_dotenv()
+
+print("Executing table creation in main...")
+# Now that the models are registered, create the tables!
+logger.debug(f"Registered tables before creation: {Base.metadata.tables.keys()}")
+Base.metadata.create_all(bind=engine)
 
 # Initialize the isolated logger for this file
 logger = get_logger(__name__, "main.log")
@@ -50,9 +59,8 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 
 #Classes
 class ChatRequest(BaseModel):
-    """The expected JSON payload from the React frontend."""
     raw_question: str
-    chat_history: Optional[str] = ""
+    session_id: Optional[str] = None  # None means "create a new chat"
 
 # ==========================================
 # AUTHENTICATION & JWT LOGIC
@@ -443,59 +451,132 @@ async def delete_user_subject(
 # ==========================================
 # Chat API
 # ==========================================
+
 @app.post("/chat")
 async def chat_endpoint(
     request: ChatRequest, 
-    user_id: str = Depends(get_current_user_from_cookie)
+    user_id: str = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
 ):
     """
     Main endpoint that triggers the Adaptive CRAG LangGraph state machine.
     """
     try:
-        logger.info(f"Received query from user {user_id}: {request.raw_question[:50]}...")
-        
-        # 1. Initialize the starting state for LangGraph
-        # We only need to provide the initial inputs. The graph will populate the rest.
+        # --- 1. SESSION MANAGEMENT ---
+        if request.session_id:
+            # Fetch existing chat
+            chat_session = db.query(ChatSession).filter(
+                ChatSession.id == request.session_id, 
+                ChatSession.user_id == user_id
+            ).first()
+            
+            if not chat_session:
+                raise HTTPException(status_code=404, detail="Chat session not found")
+        else:
+            # Create a brand new chat
+            chat_session = ChatSession(user_id=user_id, chat_state=[])
+            db.add(chat_session)
+            db.commit()
+            db.refresh(chat_session)
+            
+        # Extract history for LangGraph
+        current_history = chat_session.chat_state 
+
+        # --- 2. LANGGRAPH EXECUTION ---
+        logger.debug(f"Invoking LangGraph for user {user_id} with question: {request.raw_question} and session {chat_session.id}")
         initial_state = {
             "user_id": user_id,
             "raw_question": request.raw_question,
-            "chat_history": request.chat_history,
+            "chat_history": current_history, # Pass DB history to your agent
         }
         
-        # 2. Execute the Graph
-        # .invoke() runs the state machine synchronously from start to finish
         final_state = ChatBot.invoke(initial_state)
-        
-        # 3. Extract the outputs safely using .get()
         response_text = final_state.get("final_response", "Error: No response generated.")
         
-        crag_status = final_state.get("status", "BYPASSED_CRAG") 
-        confidence = final_state.get("confidence_score", 0.0)
-        used_tools = final_state.get("needs_tools", False)
-        subject = final_state.get("subject", "Unknown")
-        detail_level = final_state.get("detail_level", "Unknown")
+        # --- 3. SAVE NEW MESSAGES TO JSONB ---
+        # Append the new user and AI messages to the history list
+        chat_session.chat_state.append({"role": "user", "content": request.raw_question})
+        chat_session.chat_state.append({"role": "ai", "content": response_text})
         
-        logger.info(f"Successfully generated response for user {user_id}. Status: {crag_status}")
-        
-        # PACKAGE THE DATA INTO A DICTIONARY FIRST
+        # SQLAlchemy requires this flag when mutating a JSONB dictionary/list in place
+        logger.debug(f"Updating chat_state for session {chat_session.id} with new messages.")
+        flag_modified(chat_session, "chat_state") 
+        db.commit()
+
+        # --- 4. RETURN RESPONSE ---
         chat_data = {
+            "session_id": chat_session.id, # Frontend MUST save this to use on the next prompt
             "response": response_text,
-            "status": crag_status,
-            "confidence": confidence,
-            "used_tools": used_tools,
-            "subject": subject,
-            "detail_level": detail_level
+            "status": final_state.get("status", "BYPASSED_CRAG"),
+            "used_tools": final_state.get("needs_tools", False)
         }
         
-        
-        # Return the structured JSON to the frontend
-        return success_response(message="Chat generated successfully", data=chat_data)
-        
+        return success_response(message="Chat generated", data=chat_data)
+
     except Exception as e:
-        # USE RAISE_API_ERROR HERE:
-        raise_api_error(status_code=500, message="Internal Server Error during LangGraph execution.", error_details=e)
+        db.rollback()
+        raise_api_error(status_code=500, message="Internal Server Error", error_details=e)
+
+@app.get("/chats")
+async def get_user_chats(
+    user_id: str = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """Fetches all chat sessions for the sidebar UI."""
+    logger.info(f"Fetching all chat sessions for user_id: {user_id}")
+    sessions = db.query(ChatSession).filter(ChatSession.user_id == user_id)\
+                 .order_by(ChatSession.updated_at.desc()).all()
+
+    logger.debug(f"Found {len(sessions)} chat sessions for user_id: {user_id}")
+    # Return just the ID, the first message as a "title", and the timestamp
+    chat_list = []
+    for s in sessions:
+        title = "New Chat"
+        if len(s.chat_state) > 0:
+            # Grab the first 30 characters of the very first user prompt
+            title = s.chat_state[0].get("content", "New Chat")[:30] + "..."
+            
+        chat_list.append({
+            "session_id": s.id,
+            "title": title,
+            # Convert datetime to a JSON friendly string
+            "updated_at": s.updated_at.isoformat() if s.updated_at else None 
+        })
+        
+    return success_response(message="Chats fetched successfully", data=chat_list)
 
 
+@app.get("/chats/{session_id}")
+async def get_single_chat(
+    session_id: str,
+    user_id: str = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """Fetches the full message history for a specific chat."""
+    chat = db.query(ChatSession).filter(
+        ChatSession.id == session_id, 
+        ChatSession.user_id == user_id
+    ).first()
+    logger.info(f"Fetching chat history for session_id: {session_id} (user_id: {user_id})")
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+        
+    # --- THE FIX: Format the JSONB data for React ---
+    formatted_history = []
+    for index, msg in enumerate(chat.chat_state):
+        # Convert Langchain's 'ai' role to your frontend's 'bot' role
+        role = "bot" if msg.get("role") in ["ai", "assistant"] else "user"
+        
+        formatted_history.append({
+            "id": f"history-{index}",  # Generate a unique ID for React's mapping
+            "role": role,
+            "text": msg.get("content", "")  # Map 'content' to 'text'
+        })
+        
+    return success_response(message="Chat fetched successfully", data={
+        "session_id": chat.id,
+        "chat_state": formatted_history
+    })
 # ==========================================
 # SERVER EXECUTION
 # ==========================================
