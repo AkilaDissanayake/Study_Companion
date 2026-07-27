@@ -12,6 +12,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 from dotenv import load_dotenv
 
+
 # Load environmental variables from the .env file
 load_dotenv()
 
@@ -27,9 +28,7 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 # Declarative base class that mappings will inherit from to form SQL tables
 Base = declarative_base()
-#Create tables if they don't exist yet
-print("Checking database tables...")
-Base.metadata.create_all(bind=engine)
+
 
 def get_db():
     """
