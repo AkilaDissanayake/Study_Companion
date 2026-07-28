@@ -8,8 +8,9 @@ PostgreSQL JSONB conversational storage tables.
 """
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, Integer, DateTime
+from sqlalchemy import Column, String, Integer, DateTime,ForeignKey,JSON
 from sqlalchemy.dialects.postgresql import JSONB, ARRAY  
+from sqlalchemy.sql import func
 
 from utils.database_handler import Base
 
@@ -46,3 +47,12 @@ class ChatSession(Base):
     chat_state = Column(JSONB, default=list, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+class QuizRecord(Base):
+    __tablename__ = "quizzes"
+    
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    session_id = Column(String, ForeignKey("chat_sessions.id"))
+    user_id = Column(String)
+    full_quiz_data = Column(JSON)  # Stores the LLM output (with answers!)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())

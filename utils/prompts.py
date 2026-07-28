@@ -109,3 +109,48 @@ Raw Data/Insights to synthesize:
     
     ("human", "User's Original Query: {rewritten_question}\n\nPlease generate the final response.")
 ])
+
+
+
+
+# ===========================================
+# Quiz Generation Prompts
+# ===========================================
+
+
+# --- Node 1: Drafter ---
+QUIZ_DRAFTER_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """You are an expert educator. Generate a 3-question quiz based ONLY on the provided chat history.
+    
+    You MUST output strictly as JSON using this exact schema: 
+    {{
+        "title": "Quiz Title", 
+        "questions": [
+            {{
+                "question": "...", 
+                "options": ["A", "B", "C", "D"], 
+                "correct_answers": ["Exact string of correct option 1", "Exact string of correct option 2"], 
+                "explanation": "Short explanation of why these are correct"
+            }}
+        ]
+    }}
+    
+    CRITICAL RULES:
+    1. Some questions should have ONE correct answer, and some should have MULTIPLE correct answers.
+    2. Put ALL correct options inside the "correct_answers" list.
+    
+    CRITICAL INSTRUCTION: If you receive 'Previous Critique', it means your last attempt hallucinated facts. You MUST rewrite the failing questions to comply with the critique."""),
+    ("human", "Chat History:\n{history}\n\nPrevious Critique:\n{critique}")
+])
+
+# --- Node 2: Evaluator ---
+QUIZ_CRITIC_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """You are a strict factual verifier. Your ONLY job is to compare a Draft Quiz against a Chat History.
+    
+    For each question in the quiz, verify if the fact required to answer it is EXPLICITLY stated in the Chat History.
+    
+    RULES:
+    1. If ALL questions are fully supported by the text, output exactly the word: PASS
+    2. If ANY question contains hallucinations or relies on outside knowledge, output a natural language critique explaining exactly which question failed and why it is not supported by the text. Do not output JSON."""),
+    ("human", "Chat History:\n{history}\n\nDraft Quiz:\n{draft_quiz}")
+])

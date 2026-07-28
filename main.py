@@ -3,6 +3,7 @@ import os
 import jwt
 import datetime
 import mimetypes
+import uuid
 from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Response, Request,Form,BackgroundTasks,Query,Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -21,11 +22,12 @@ from utils.json_handler import *
 from utils.file_handler import *
 from utils.vdb_handler import embed_uploaded_file,delete_file_from_vdb,delete_subject_from_vdb
 from utils.database_handler import engine, Base,get_db
-from utils.db_models import TokenUsage, ChatSession
+from utils.db_models import TokenUsage, ChatSession,QuizRecord
 from utils.response_handler import success_response, raise_api_error 
 from utils.database_handler import engine, Base
 from utils import db_models 
 from models.chatbot import ChatBot
+from models.quiz_generator import QuizGeneratorAgent
 # Load environment variables (.env)
 load_dotenv()
 
@@ -61,6 +63,10 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 class ChatRequest(BaseModel):
     raw_question: str
     session_id: Optional[str] = None  # None means "create a new chat"
+
+class QuizSubmission(BaseModel):
+    answers: Dict[str, str]
+
 
 # ==========================================
 # AUTHENTICATION & JWT LOGIC
@@ -462,7 +468,7 @@ async def chat_endpoint(
     Main endpoint that triggers the Adaptive CRAG LangGraph state machine.
     """
     try:
-        # --- 1. SESSION MANAGEMENT ---
+        # --- SESSION MANAGEMENT ---
         if request.session_id:
             # Fetch existing chat
             chat_session = db.query(ChatSession).filter(
@@ -482,7 +488,7 @@ async def chat_endpoint(
         # Extract history for LangGraph
         current_history = chat_session.chat_state 
 
-        # --- 2. LANGGRAPH EXECUTION ---
+        # ---  LANGGRAPH EXECUTION ---
         logger.debug(f"Invoking LangGraph for user {user_id} with question: {request.raw_question} and session {chat_session.id}")
         initial_state = {
             "user_id": user_id,
@@ -493,7 +499,7 @@ async def chat_endpoint(
         final_state = ChatBot.invoke(initial_state)
         response_text = final_state.get("final_response", "Error: No response generated.")
         
-        # --- 3. SAVE NEW MESSAGES TO JSONB ---
+        # ---  SAVE NEW MESSAGES TO JSONB ---
         # Append the new user and AI messages to the history list
         chat_session.chat_state.append({"role": "user", "content": request.raw_question})
         chat_session.chat_state.append({"role": "ai", "content": response_text})
@@ -503,7 +509,7 @@ async def chat_endpoint(
         flag_modified(chat_session, "chat_state") 
         db.commit()
 
-        # --- 4. RETURN RESPONSE ---
+        # ---  RETURN RESPONSE ---
         chat_data = {
             "session_id": chat_session.id, # Frontend MUST save this to use on the next prompt
             "response": response_text,
@@ -559,9 +565,13 @@ async def get_single_chat(
     ).first()
     logger.info(f"Fetching chat history for session_id: {session_id} (user_id: {user_id})")
     if not chat:
-        raise HTTPException(status_code=404, detail="Chat not found")
+        raise_api_error(
+            status_code=404, 
+            message="Chat not found", 
+            error_details=f"The chat session '{session_id}' does not exist or you do not have permission to access it."
+        )
         
-    # --- THE FIX: Format the JSONB data for React ---
+    # --- Format the JSONB data for React ---
     formatted_history = []
     for index, msg in enumerate(chat.chat_state):
         # Convert Langchain's 'ai' role to your frontend's 'bot' role
@@ -595,13 +605,198 @@ async def delete_chat_session(
     
     if not chat:
         logger.warning(f"Chat not found or unauthorized delete attempt: session_id={session_id}, user_id={user_id}")
-        raise HTTPException(status_code=404, detail="Chat not found")
+        raise_api_error(status_code=404, message="Chat not found", error_details=f"The chat session '{session_id}' does not exist or you do not have permission to access it.")  #hANDLE
+
         
     db.delete(chat)
     db.commit()
     
     logger.info(f"Successfully deleted chat session_id: {session_id}")
     return success_response(message="Chat deleted successfully")
+
+# ==========================================
+# Quiz API
+# ==========================================
+
+@app.post("/chats/{session_id}/quiz")
+async def generate_quiz_from_chat(
+    session_id: str,
+    user_id: str = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """Generates a zero-hallucination quiz using LangGraph, saves answers, and sends sanitized questions."""
+    logger.info(f"Triggering LangGraph Quiz Agent for session_id: {session_id}")
+    
+    try:
+        # 1. Fetch the chat
+        chat = db.query(ChatSession).filter(
+            ChatSession.id == session_id, ChatSession.user_id == user_id
+        ).first()
+        
+        if not chat or not chat.chat_state:
+            return raise_api_error(
+                status_code=404, 
+                message="Chat not found", 
+                error_details=f"The chat session '{session_id}' does not exist or is empty."
+            )
+            
+        history_text = "\n".join([f"{msg.get('role', 'user')}: {msg.get('content', '')}" for msg in chat.chat_state])
+        
+        # 2. INVOKE THE LANGGRAPH AGENT
+        initial_state = {
+            "chat_history": history_text,
+            "retry_count": 0,
+            "critique": ""
+        }
+        
+        # The agent will loop internally until the Critic node outputs "PASS"
+        final_state = QuizGeneratorAgent.invoke(initial_state)
+        
+        # Extract the verified quiz from the final state
+        full_quiz_data = final_state["draft_quiz"]
+        
+        # 3. Save the full data (with answers) securely to the database
+        quiz_id = str(uuid.uuid4())
+        new_quiz = QuizRecord(
+            id=quiz_id,
+            session_id=session_id,
+            user_id=user_id,
+            full_quiz_data=full_quiz_data
+        )
+        db.add(new_quiz)
+        db.commit()
+        
+        # 4. Strip answers before sending to the React frontend
+        sanitized_questions = [
+            {"question": q["question"], "options": q["options"]} 
+            for q in full_quiz_data.get("questions", [])
+        ]
+        
+        return success_response(message="Quiz generated successfully!", data={
+            "quiz_id": quiz_id,
+            "title": full_quiz_data.get("title", "Generated Quiz"),
+            "questions": sanitized_questions
+        })
+        
+    except Exception as e:
+        logger.error(f"Quiz generation failed: {e}")
+        return raise_api_error(status_code=500, message="Internal Server Error", error_details=str(e))
+
+
+
+@app.post("/quizzes/{quiz_id}/grade")
+async def grade_quiz(
+    quiz_id: str,
+    submission: QuizSubmission,
+    user_id: str = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    try:
+        quiz_record = db.query(QuizRecord).filter(
+            QuizRecord.id == quiz_id, QuizRecord.user_id == user_id
+        ).first()
+
+        if not quiz_record:
+            return raise_api_error(status_code=404, message="Quiz not found", error_details="No matching quiz record.")
+
+        full_data = quiz_record.full_quiz_data
+        total_score = 0.0
+        results = {}
+
+        for idx, q in enumerate(full_data.get("questions", [])):
+            idx_str = str(idx)
+            
+            # Convert arrays to sets for easy math comparisons
+            user_ans = set(submission.answers.get(idx_str, []))
+            correct_ans = set(q.get("correct_answers", [q.get("answer")] if q.get("answer") else []))
+            
+            # 1. Calculate hits and misses
+            correct_hits = user_ans.intersection(correct_ans)
+            incorrect_hits = user_ans.difference(correct_ans)
+            
+            # 2. Calculate partial credit (max 1 point per question)
+            if len(correct_ans) > 0:
+                # E.g., 2 correct answers total. User picks 1 right, 0 wrong -> 0.5 points
+                # User picks 1 right, 1 wrong -> 0.0 points
+                points = (len(correct_hits) - len(incorrect_hits)) / len(correct_ans)
+                q_score = max(0.0, points) # Prevent negative scores on a question
+            else:
+                q_score = 0.0
+                
+            total_score += q_score
+            
+            # 3. Check if it was perfectly answered for the UI styling
+            is_perfect = (user_ans == correct_ans)
+            
+            results[idx_str] = {
+                "user_answers": list(user_ans),
+                "correct_answers": list(correct_ans),
+                "is_correct": is_perfect,
+                "points_awarded": round(q_score, 2), # Send partial points to frontend
+                "explanation": q["explanation"]
+            }
+
+        return success_response(message="Quiz graded!", data={
+            "score": round(total_score, 2), # Round to 2 decimal places (e.g., 2.5)
+            "total": len(full_data.get("questions", [])),
+            "results": results
+        })
+        
+    except Exception as e:
+        logger.error(f"Quiz grading failed: {e}")
+        return raise_api_error(status_code=500, message="Internal Server Error", error_details=str(e))
+
+
+        
+@app.get("/quizzes")
+async def get_all_quizzes(
+    user_id: str = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """Fetches a lightweight list of all past quizzes for the sidebar/list view."""
+    try:
+        quizzes = db.query(QuizRecord).filter(QuizRecord.user_id == user_id).order_by(QuizRecord.created_at.desc()).all()
+        
+        quiz_list = [
+            {
+                "id": q.id, 
+                "title": q.full_quiz_data.get("title", "Untitled Quiz"),
+                "created_at": q.created_at
+            } 
+            for q in quizzes
+        ]
+        return success_response(message="Quizzes fetched", data=quiz_list)
+    except Exception as e:
+        return raise_api_error(status_code=500, message="Failed to fetch quizzes", error_details=str(e))
+
+@app.get("/quizzes/{quiz_id}")
+async def get_single_quiz(
+    quiz_id: str,
+    user_id: str = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """Fetches a specific quiz and STRIPS THE ANSWERS before sending to frontend."""
+    try:
+        quiz = db.query(QuizRecord).filter(
+            QuizRecord.id == quiz_id, QuizRecord.user_id == user_id
+        ).first()
+        
+        if not quiz:
+            return raise_api_error(status_code=404, message="Quiz not found", error_details="Quiz does not exist.")
+            
+        # Securely sanitize the questions
+        sanitized_questions = [
+            {"question": q["question"], "options": q["options"]} 
+            for q in quiz.full_quiz_data.get("questions", [])
+        ]
+        
+        return success_response(message="Quiz loaded", data={
+            "quiz_id": quiz.id,
+            "title": quiz.full_quiz_data.get("title"),
+            "questions": sanitized_questions
+        })
+    except Exception as e:
+        return raise_api_error(status_code=500, message="Failed to load quiz", error_details=str(e))
 # ==========================================
 # SERVER EXECUTION
 # ==========================================
