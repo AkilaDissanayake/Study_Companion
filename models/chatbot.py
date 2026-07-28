@@ -21,7 +21,8 @@ from utils.json_handler import read_config
 from utils.prompts import (
     REWRITER_PROMPT, 
     CLASSIFIER_PROMPT, 
-    SAFETY_PROMPT, 
+    SAFETY_PROMPT,
+    GREETING_PROMPT, 
     DOMAIN_TUTOR_PROMPT,
     COMPOSER_PROMPT
 )
@@ -163,6 +164,18 @@ def safety_node(state: AgentState):
         }
     except json.JSONDecodeError:
         return {"is_safe": True, "safety_reason": "default assumed safe"}
+
+def greeting_node(state: AgentState):
+    """Handles casual conversation and greetings natively without RAG."""
+    logger.info(f"Routing to Greeting Node for input: {state.get('rewritten_question')}")
+    tracker = TokenTrackingCallbackHandler(state["user_id"], "gpt-4o-mini-greeting")
+    
+    chain = GREETING_PROMPT | fast_llm.with_config({"callbacks": [tracker]})
+    
+    response = chain.invoke({"rewritten_question": state["rewritten_question"]})
+    
+    logger.info(f"Greeting generated: {response.content}")
+    return {"final_response": response.content}
 
 
 def retrieval_node(state: AgentState):
@@ -396,6 +409,11 @@ def route_safety(state: AgentState):
     logger.info(f"Routing after safety check: is_safe={state.get('is_safe')}, needs_tools={state.get('needs_tools')}, needs_documents={state.get('needs_documents')}")
     if not state.get("is_safe", True):
         return "answer_composer"
+
+    if not state.get("needs_documents") and not state.get("needs_tools"):
+        logger.info("Conversational query detected. Routing to greeting_node.")
+        return "greeting_node"
+
     if state.get("needs_tools") and not state.get("needs_documents"):
         return "tool_execution"
     return "retrieval_node"
@@ -431,6 +449,7 @@ workflow = StateGraph(AgentState)
 workflow.add_node("rewriter", rewrite_node)
 workflow.add_node("classifier", classify_node)
 workflow.add_node("safety", safety_node)
+workflow.add_node("greeting_node", greeting_node)
 workflow.add_node("retrieval_node", retrieval_node)
 workflow.add_node("grader_node", grade_context_node)
 workflow.add_node("web_search_node", web_search_node)
@@ -447,13 +466,14 @@ workflow.add_edge("classifier", "safety")
 workflow.add_conditional_edges(
     "safety",
     route_safety,
-    {
+    {   "greeting_node": "greeting_node",
         "answer_composer": "answer_composer",
         "tool_execution": "tool_execution",
         "retrieval_node": "retrieval_node"
     }
 )
 
+workflow.add_edge("greeting_node", END)
 workflow.add_edge("retrieval_node", "grader_node")
 
 #  CRAG Router
