@@ -577,6 +577,31 @@ async def get_single_chat(
         "session_id": chat.id,
         "chat_state": formatted_history
     })
+
+
+@app.delete("/chats/{session_id}")
+async def delete_chat_session(
+    session_id: str,
+    user_id: str = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """Deletes a specific chat session for the authenticated user."""
+    logger.info(f"Deleting chat session_id: {session_id} for user_id: {user_id}")
+    
+    chat = db.query(ChatSession).filter(
+        ChatSession.id == session_id, 
+        ChatSession.user_id == user_id
+    ).first()
+    
+    if not chat:
+        logger.warning(f"Chat not found or unauthorized delete attempt: session_id={session_id}, user_id={user_id}")
+        raise HTTPException(status_code=404, detail="Chat not found")
+        
+    db.delete(chat)
+    db.commit()
+    
+    logger.info(f"Successfully deleted chat session_id: {session_id}")
+    return success_response(message="Chat deleted successfully")
 # ==========================================
 # SERVER EXECUTION
 # ==========================================
