@@ -52,7 +52,7 @@ class QuizRecord(Base):
     __tablename__ = "quizzes"
     
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    session_id = Column(String, ForeignKey("chat_sessions.id"))
+    session_id = Column(String, ForeignKey("chat_sessions.id",ondelete="CASCADE"))
     user_id = Column(String)
     full_quiz_data = Column(JSON)  # Stores the LLM output (with answers!)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
