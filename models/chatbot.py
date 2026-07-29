@@ -9,6 +9,8 @@ Implements full Corrective RAG (CRAG) with Web Search Fallback and Dynamic Conte
 
 import json
 import math
+import asyncio
+import inspect
 from typing import TypedDict, Any
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
@@ -92,13 +94,13 @@ heavy_llm = ChatOpenAI(model="gpt-4o", temperature=0.7)
 
 # --- Node Definitions ---
 
-def rewrite_node(state: AgentState):
+async def rewrite_node(state: AgentState):
 
     logger.info(f"Rewriting user question for clarity: {state['raw_question']}")
     tracker = TokenTrackingCallbackHandler(state["user_id"], "gpt-4o-mini-rewriter")
     chain = REWRITER_PROMPT | fast_llm.with_config({"callbacks": [tracker]})
     
-    response = chain.invoke({
+    response = await chain.ainvoke({
         "chat_history": state.get("chat_history", ""),
         "raw_question": state["raw_question"]
     })
@@ -106,7 +108,7 @@ def rewrite_node(state: AgentState):
     return {"rewritten_question": response.content}
 
 
-def classify_node(state: AgentState):
+async def classify_node(state: AgentState):
     logger.info(f"Classifying user question.")
     tracker = TokenTrackingCallbackHandler(state["user_id"], "gpt-4o-mini-classifier")
     llm_json = fast_llm.bind(response_format={"type": "json_object"}).with_config({"callbacks": [tracker]})
@@ -129,7 +131,7 @@ def classify_node(state: AgentState):
         tools_desc = "No external tools currently available."
     
     # Inject both the question AND the tool list into the prompt
-    response = chain.invoke({
+    response = await chain.ainvoke({
         "rewritten_question": state["rewritten_question"],
         "tools_description": tools_desc,
         "available_subjects": subjects_string
@@ -148,14 +150,14 @@ def classify_node(state: AgentState):
         return {"subject": "General", "detail_level": "detailed", "needs_tools": False, "needs_documents": True}
 
 
-def safety_node(state: AgentState):
+async def safety_node(state: AgentState):
 
     logger.info(f"Performing safety check on question")
     tracker = TokenTrackingCallbackHandler(state["user_id"], "gpt-4o-mini-safety")
     llm_json = fast_llm.bind(response_format={"type": "json_object"}).with_config({"callbacks": [tracker]})
     chain = SAFETY_PROMPT | llm_json
     
-    response = chain.invoke({"rewritten_question": state["rewritten_question"]})
+    response = await chain.ainvoke({"rewritten_question": state["rewritten_question"]})
     try:
         data = json.loads(response.content)
         logger.debug(f"Safety check result: {data}")
@@ -166,20 +168,20 @@ def safety_node(state: AgentState):
     except json.JSONDecodeError:
         return {"is_safe": True, "safety_reason": "default assumed safe"}
 
-def greeting_node(state: AgentState):
+async def greeting_node(state: AgentState):
     """Handles casual conversation and greetings natively without RAG."""
     logger.info(f"Routing to Greeting Node for input: {state.get('rewritten_question')}")
     tracker = TokenTrackingCallbackHandler(state["user_id"], "gpt-4o-mini-greeting")
     
     chain = GREETING_PROMPT | fast_llm.with_config({"callbacks": [tracker]})
     
-    response = chain.invoke({"rewritten_question": state["rewritten_question"]})
+    response = await chain.ainvoke({"rewritten_question": state["rewritten_question"]})
     
     logger.info(f"Greeting generated: {response.content}")
     return {"final_response": response.content}
 
 
-def retrieval_node(state: AgentState):
+async def retrieval_node(state: AgentState):
     """Pulls formatted context chunks (with sources) from the Vector DB."""
     
     logger.info(f"Retrieving context from Vector DB for question")
@@ -188,7 +190,8 @@ def retrieval_node(state: AgentState):
         state["subject"] = "root"  
         
     # search_vdb now returns the strings PRE-FORMATTED with [Source: filename.pdf]
-    res = search_vdb(
+    res = await asyncio.to_thread(
+        search_vdb,
         user_id=state["user_id"], 
         subject=state["subject"], 
         query=state["rewritten_question"]
@@ -200,42 +203,49 @@ def retrieval_node(state: AgentState):
     return {"retrieved_chunks": chunks}
 
 
-def grade_context_node(state: AgentState):
+async def grade_context_node(state: AgentState):
     """Full CRAG Evaluator: Implements the 3-tier Correct/Ambiguous/Incorrect logic."""
 
     logger.info(f"Grading retrieved context")
     query = state['rewritten_question']
     raw_chunks = state.get('retrieved_chunks', [])
     
-    filtered_chunks = []
-    max_score = 0.0
+    # NEW: Create a synchronous helper function for the heavy math
+    def _evaluate_chunks():
+        filtered = []
+        highest_score = 0.0
+        
+        for chunk in raw_chunks:
+            if not chunk.strip():
+                continue
+                
+            raw_score = float(grader_model.predict([query, chunk]))
+            
+            try:
+                confidence = (1 / (1 + math.exp(-raw_score))) * 100
+            except OverflowError:
+                confidence = 0.0 if raw_score < 0 else 100.0
+                
+            if confidence > highest_score:
+                highest_score = confidence
+            
+            if confidence >= 30.0:
+                filtered.append(chunk)
+                
+        return filtered, highest_score
+
+    # NEW: Run the heavy CPU math on a background thread!
+    filtered_chunks, max_score = await asyncio.to_thread(_evaluate_chunks)
     
-    for chunk in raw_chunks:
-        if not chunk.strip():
-            continue
-            
-        raw_score = float(grader_model.predict([query, chunk]))
-        
-        # Mathematical safeguard to prevent Python OverflowErrors on extreme logits
-        try:
-            confidence = (1 / (1 + math.exp(-raw_score))) * 100
-        except OverflowError:
-            confidence = 0.0 if raw_score < 0 else 100.0
-            
-        if confidence > max_score:
-            max_score = confidence
-        
-        # Keep chunks that have at least some relevance (Ambiguous or Correct)
-        if confidence >= 30.0:
-            filtered_chunks.append(chunk)
     logger.debug(f"Filtered chunks: {filtered_chunks} with max confidence score: {max_score}")
+    
     # 3-Tier CRAG Decision Gate
     if max_score >= 80.0:
         status = "CORRECT"
         is_answerable = True
     elif max_score <= 30.0:
         status = "INCORRECT"
-        is_answerable = False  # Will be flipped to True if Web Search rescues it
+        is_answerable = False  
     else:
         status = "AMBIGUOUS"
         is_answerable = True
@@ -249,22 +259,20 @@ def grade_context_node(state: AgentState):
         "status": status
     }
 
-
-def web_search_node(state: AgentState):
+async def web_search_node(state: AgentState):
     """CRAG Fallback: Fetches and refines external knowledge when the database fails."""
     
     logger.info("Routing to external web search node.")
     
-    # 1. Call our newly modularized script
-    formatted_web_data, is_rescued = search_and_grade_web(
+    # NEW: Push the blocking internet request to a background thread!
+    formatted_web_data, is_rescued = await asyncio.to_thread(
+        search_and_grade_web,
         query=state["rewritten_question"], 
         grader_model=grader_model
     )
     
-    # 2. CRAG AMBIGUOUS Logic: Combine database and web
     if state.get("status") == "AMBIGUOUS":
         new_context = state.get("context", "") + "\n\n" + formatted_web_data
-    # 3. CRAG INCORRECT Logic: Discard database entirely
     else:
         new_context = formatted_web_data
         
@@ -274,7 +282,7 @@ def web_search_node(state: AgentState):
     }
 
 
-def domain_tutor_node(state: AgentState):
+async def domain_tutor_node(state: AgentState):
     """Generates the educational answer based on the refined CRAG context."""
     logger.info(f"Generating educational answer for question: {state['rewritten_question']}")
     tracker = TokenTrackingCallbackHandler(state["user_id"], "gpt-4o-mini-tutor")
@@ -286,7 +294,7 @@ def domain_tutor_node(state: AgentState):
     chain = DOMAIN_TUTOR_PROMPT | llm_tracked
     
     # Invoke the chain by passing the state variables as a dictionary
-    response = chain.invoke({
+    response =  await chain.ainvoke({
         "context": state.get('context', 'No context available.'),
         "detail_level": state.get('detail_level', 'detailed'),
         "subject": state.get('subject', 'General'),
@@ -296,52 +304,57 @@ def domain_tutor_node(state: AgentState):
     return {"raw_data": response.content}
 
 
-def tool_execution_node(state: AgentState):
+async def tool_execution_node(state: AgentState): #async put this out of main event loop
+    """
+    Executes multiple requested tools concurrently in parallel using asyncio.gather.
+    Includes user_id injection for workspace management tools.
+    """
     logger.info(f"Executing external tools for question: {state['rewritten_question']}")
     tracker = TokenTrackingCallbackHandler(state["user_id"], "gpt-4o-tools")
     llm_with_tools = heavy_llm.bind_tools(tools).with_config({"callbacks": [tracker]})
     
-    # Ask the LLM which tool it wants to run and with what arguments
-    #LangChain automatically takes the names and descriptions of  Python functions, turns them into a massive JSON schema
-    response = llm_with_tools.invoke(state["rewritten_question"])
+    # Asynchronous LLM call
+    response = await llm_with_tools.ainvoke(state["rewritten_question"])
     
-    # If the LLM decided it didn't need a tool after all and just answered
     if not response.tool_calls:
         logger.info("LLM decided not to use a tool and provided a direct response.")
         return {"raw_data": response.content}
         
-    #  Create a dictionary to easily look up our actual Python tool functions by name
     tool_map = {tool.name: tool for tool in tools}
     
-    tool_outputs = []
-    
-    #  Iterate over the tools the LLM selected and actually execute them
-    for tool_call in response.tool_calls:
+    # Worker function to execute a single tool call concurrently
+    async def run_single_tool(tool_call):
         tool_name = tool_call["name"]
-        tool_args = tool_call["args"]
+        tool_args = tool_call["args"].copy()
         
+        # Securely inject user_id from AgentState if required by function signature
+        tool_func = tool_map.get(tool_name)
+        if tool_func:
+            sig = inspect.signature(tool_func.func)
+            if "user_id" in sig.parameters:
+                tool_args["user_id"] = state["user_id"]
+                
         logger.info(f"Executing tool: {tool_name} with args: {tool_args}")
         
         if tool_name in tool_map:
             try:
-                # EXECUTION HAPPENS HERE: We invoke the actual LangChain tool
-                result = tool_map[tool_name].invoke(tool_args)
-                tool_outputs.append(f"[Output from {tool_name}]:\n{result}")
-                logger.info(f"Tool {tool_name} executed successfully.")
+                # Execute asynchronously
+                result = await tool_map[tool_name].ainvoke(tool_args)
+                return f"[Output from {tool_name}]:\n{result}"
             except Exception as e:
                 logger.error(f"Tool {tool_name} execution failed: {e}")
-                tool_outputs.append(f"[Error from {tool_name}]:\nExecution failed - {e}")
+                return f"[Error from {tool_name}]:\nExecution failed - {e}"
         else:
-            logger.warning(f"LLM tried to call a non-existent tool: {tool_name}")
-            tool_outputs.append(f"[Error]: Tool '{tool_name}' does not exist.")
-            
-    #  Combine the results of all executed tools into a single string for the Composer
-    final_raw_output = "\n\n".join(tool_outputs)
+            return f"[Error]: Tool '{tool_name}' does not exist."
+
+    # Execute all selected tools simultaneously across the event loop
+    tool_outputs = await asyncio.gather(*[run_single_tool(call) for call in response.tool_calls])
     
+    final_raw_output = "\n\n".join(tool_outputs)
     return {"raw_data": final_raw_output}
 
 
-def answer_composer_node(state: AgentState):
+async def answer_composer_node(state: AgentState):
     """Formats the final text and handles apologies if all data retrievals failed."""
 
     logger.info(f"Composing final answer for question: {state['rewritten_question']}")
@@ -358,7 +371,7 @@ def answer_composer_node(state: AgentState):
     tracker = TokenTrackingCallbackHandler(state["user_id"], "gpt-4o-mini-composer")
     chain = COMPOSER_PROMPT | fast_llm.with_config({"callbacks": [tracker]})
     
-    response = chain.invoke({
+    response = await chain.ainvoke({
         "raw_data": override_data,
         "rewritten_question": state["rewritten_question"]
     })
@@ -367,7 +380,7 @@ def answer_composer_node(state: AgentState):
 
 
 # --- Routing Edge Logic ---
-
+#Async not needed since simple operations, no blocking I/O
 def route_safety(state: AgentState):
     """Decides if we need to bypass the database and go straight to tools or answer composition."""
 
