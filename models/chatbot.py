@@ -27,6 +27,7 @@ from utils.prompts import (
     COMPOSER_PROMPT
 )
 from utils.token_manager import log_token_usage
+from utils.web_search import search_and_grade_web
 from utils.logger import get_logger
 
 logger = get_logger(__name__, "chatbot.log")
@@ -179,19 +180,23 @@ def greeting_node(state: AgentState):
 
 
 def retrieval_node(state: AgentState):
-    """Pulls raw context chunks from the Vector DB."""
+    """Pulls formatted context chunks (with sources) from the Vector DB."""
     
     logger.info(f"Retrieving context from Vector DB for question")
     if state.get("subject") == "General":
         logger.warning("Subject is 'General'; retrieval may yield broad results.")
-        state["subject"] = "root"  # Ensure we have a default subject for the DB query
+        state["subject"] = "root"  
+        
+    # search_vdb now returns the strings PRE-FORMATTED with [Source: filename.pdf]
     res = search_vdb(
         user_id=state["user_id"], 
         subject=state["subject"], 
         query=state["rewritten_question"]
     )
+    
     chunks = res if isinstance(res, list) else [res] if res else []
     logger.debug(f"Retrieved chunks: {chunks}")
+    
     return {"retrieved_chunks": chunks}
 
 
@@ -247,59 +252,19 @@ def grade_context_node(state: AgentState):
 
 def web_search_node(state: AgentState):
     """CRAG Fallback: Fetches and refines external knowledge when the database fails."""
-
-    logger.info(f"Performing external web search for question")
-    search_tool = DuckDuckGoSearchRun()
     
-    query = state["rewritten_question"]
+    logger.info("Routing to external web search node.")
     
-    # 1. Domain Restriction: Force the search engine to use reliable academic sources
-    academic_query = f"{query} site:edu OR site:wikipedia.org OR site:scholar.google.com"
+    # 1. Call our newly modularized script
+    formatted_web_data, is_rescued = search_and_grade_web(
+        query=state["rewritten_question"], 
+        grader_model=grader_model
+    )
     
-    try:
-        # Execute the search
-        raw_web_results = search_tool.invoke(academic_query)
-        
-        if not raw_web_results or "error" in raw_web_results.lower()[:20]:
-            raise ValueError("No results found via DuckDuckGo")
-            
-        # 2. CRAG Knowledge Refinement (Decompose-then-Recompose)
-        # DuckDuckGo strings are usually separated by '...' or newlines. We split them into chunks.
-        web_snippets = raw_web_results.split("...")
-        refined_snippets = []
-        logger.debug(f"Raw web snippets: {web_snippets}")
-        for snippet in web_snippets:
-            if len(snippet.strip()) < 15:
-                continue  # Skip empty or tiny fragments
-                
-            # Grade the web snippet using our local Cross-Encoder!
-            raw_score = float(grader_model.predict([query, snippet.strip()]))
-            try:
-                confidence = (1 / (1 + math.exp(-raw_score))) * 100
-            except OverflowError:
-                confidence = 0.0 if raw_score < 0 else 100.0
-                
-            # Keep web snippets that are at least somewhat relevant (e.g., > 40%)
-            if confidence >= 40.0:
-                refined_snippets.append(snippet.strip())
-        
-        # If the grader threw everything away, the search was a failure
-        if not refined_snippets:
-            raise ValueError("Web search returned irrelevant noise.")
-            
-        # Recompose the surviving, high-quality facts
-        formatted_web_data = "[Verified External Web Knowledge]:\n" + "\n- ".join(refined_snippets)
-        is_rescued = True
-        
-    except Exception as e:
-        logger.warning(f"Web search failed or was rejected by grader: {e}")
-        formatted_web_data = "[External Web Search Failed]"
-        is_rescued = False
-    
-    # CRAG AMBIGUOUS Logic: Combine database and web
+    # 2. CRAG AMBIGUOUS Logic: Combine database and web
     if state.get("status") == "AMBIGUOUS":
         new_context = state.get("context", "") + "\n\n" + formatted_web_data
-    # CRAG INCORRECT Logic: Discard database entirely
+    # 3. CRAG INCORRECT Logic: Discard database entirely
     else:
         new_context = formatted_web_data
         
