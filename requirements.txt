@@ -13,12 +13,13 @@ PyJWT
 # --- File Processing ---
 PyPDF2
 
-# --- Database & ORM ---
+# --- Database & Vector Store ---
 sqlalchemy
 psycopg2-binary
 chromadb
 
 # --- AI, LLMs & LangGraph ---
+openai
 langgraph
 langchain-core
 langchain-community
@@ -28,6 +29,11 @@ langchain-text-splitters
 # --- Local Models (Cross-Encoders) ---
 sentence-transformers
 
-# --- Search Internet ---
+# --- Tools, Math & Visualization ---
+numexpr
+numpy
+matplotlib
+
+# --- Web Search ---
 duckduckgo-search
 ddgs
