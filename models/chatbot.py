@@ -11,6 +11,7 @@ import json
 import math
 import asyncio
 import inspect
+import re
 from typing import TypedDict, Any
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
@@ -330,9 +331,13 @@ async def tool_execution_node(state: AgentState): #async put this out of main ev
         # Securely inject user_id from AgentState if required by function signature
         tool_func = tool_map.get(tool_name)
         if tool_func:
-            sig = inspect.signature(tool_func.func)
-            if "user_id" in sig.parameters:
-                tool_args["user_id"] = state["user_id"]
+            # LangChain stores async tools in .coroutine and sync tools in .func
+            actual_func = tool_func.func or tool_func.coroutine
+            
+            if actual_func:
+                sig = inspect.signature(actual_func)
+                if "user_id" in sig.parameters:
+                    tool_args["user_id"] = state["user_id"]
                 
         logger.info(f"Executing tool: {tool_name} with args: {tool_args}")
         
@@ -346,7 +351,6 @@ async def tool_execution_node(state: AgentState): #async put this out of main ev
                 return f"[Error from {tool_name}]:\nExecution failed - {e}"
         else:
             return f"[Error]: Tool '{tool_name}' does not exist."
-
     # Execute all selected tools simultaneously across the event loop
     tool_outputs = await asyncio.gather(*[run_single_tool(call) for call in response.tool_calls])
     
@@ -361,23 +365,40 @@ async def answer_composer_node(state: AgentState):
     if not state.get("is_safe", True):
         override_data = f"Safety Violation Flagged: {state.get('safety_reason')}. Reject the request respectfully."
         
-    # Triggered only if the DB failed AND the Web Search crashed
     elif not state.get("is_answerable", True):
         override_data = "System Note: Both the textbook database and the external web search failed to find an answer. Politely apologize to the student."
         
     else:
         override_data = state.get("raw_data", "No data provided.")
         
+    # ==========================================
+    #  THE BASE64 SHIELD
+    
+    # ==========================================
+    # Find any massive Base64 Markdown images
+    image_pattern = r"(!\[.*?\]\(data:image.*?base64,[^\)]+\))"
+    images = re.findall(image_pattern, override_data)
+    
+    # Replace the massive string with a tiny placeholder for the LLM
+    text_only_data = re.sub(image_pattern, "[IMAGE_PLACEHOLDER]", override_data)
+    
     tracker = TokenTrackingCallbackHandler(state["user_id"], "gpt-4o-mini-composer")
     chain = COMPOSER_PROMPT | fast_llm.with_config({"callbacks": [tracker]})
     
+    # Send ONLY the text and the placeholder to the LLM
     response = await chain.ainvoke({
-        "raw_data": override_data,
+        "raw_data": text_only_data,
         "rewritten_question": state["rewritten_question"]
     })
-    logger.info(f"Final answer generated: {response.content}")
-    return {"final_response": response.content}
-
+    
+    final_text = response.content
+    
+    # Instantly inject the massive Base64 strings back into the final response
+    for img in images:
+        final_text = final_text.replace("[IMAGE_PLACEHOLDER]", img, 1)
+    logger.info(f"Final answer generated. Re-attached {len(images)} images.")
+    
+    return {"final_response": final_text}
 
 # --- Routing Edge Logic ---
 #Async not needed since simple operations, no blocking I/O
