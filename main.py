@@ -500,7 +500,7 @@ async def chat_endpoint(
             "chat_history": current_history, # Pass DB history to your agent
         }
         
-        final_state = ChatBot.invoke(initial_state)
+        final_state =await ChatBot.ainvoke(initial_state)
         response_text = final_state.get("final_response", "Error: No response generated.")
         
         # ---  SAVE NEW MESSAGES TO JSONB ---
