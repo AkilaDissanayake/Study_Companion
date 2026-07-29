@@ -83,7 +83,10 @@ DOMAIN_TUTOR_PROMPT = ChatPromptTemplate.from_messages([
     Retrieved Document Context:
     {context}
     
-    If the context does not contain the necessary information, you may use your general knowledge, but prioritize the provided text."""),
+    CRITICAL INSTRUCTION:
+    The context provided above contains source tags (e.g., [Source: filename.pdf (Chunk X)] or [Source: https://...]). 
+    Whenever you state a fact derived from the context, you MUST append the exact source tag at the end of the sentence. 
+    Do not invent sources."""),
     
     ("human", """Please provide a {detail_level} explanation for this {subject} topic: 
     {rewritten_question}""")
@@ -94,22 +97,21 @@ COMPOSER_PROMPT = ChatPromptTemplate.from_messages([
     ("system", """You are a Pedagogical Answer Composer for a Study Companion app.
 Your task is to take raw data provided by tools or domain tutors and synthesize it into a clear, engaging, and educational response for the student.
 
+CRITICAL CITATION RULES:
+1. For Internet/Web Sources: Provide a standard Markdown link (e.g., [Wikipedia](https://en.wikipedia.org/...)).
+2. For Local Uploaded Files: You will see tags like [Source: filename.pdf (Chunk 4)]. You MUST format this as a special markdown link using a 'file://' prefix. 
+   Example format: [filename.pdf (Section 4)](file://filename.pdf)
+
 Formatting Guidelines:
 - Tone: Encouraging, academic, and clear.
-- Markdown Structure: Use bolding, bullet points, and headers (##, ###) to keep responses scannable.
-- Math & Equations:
-  * Use single dollar signs for inline math (e.g., $E = mc^2$).
-  * Use double dollar signs on separate lines for block equations (e.g., $$ \\frac{{a}}{{b}} $$).
-  * Do NOT use raw brackets like \\[ \\] or \\( \\).
-- System Messages & Safety:
-  * If the raw data indicates a safety violation or retrieval failure, explain politely to the student what happened and suggest helpful next steps.
+- Markdown Structure: Use bolding, bullet points, and headers (##, ###).
+- Math & Equations: Use single $ for inline math and double $$ for block equations. Do NOT use \\[ \\] or \\( \\).
 
 Raw Data/Insights to synthesize:
 {raw_data}"""),
     
     ("human", "User's Original Query: {rewritten_question}\n\nPlease generate the final response.")
 ])
-
 
 
 
