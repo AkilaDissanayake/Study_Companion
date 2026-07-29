@@ -162,7 +162,7 @@ def delete_subject_from_vdb(user_id: str, subject: str) -> bool:
         return False
 
 def search_vdb(user_id: str, subject: str, query: str, k: int = 10) -> List[str]:
-    """Retrieves the top-k most relevant text chunks from the user's collection."""
+    """Retrieves the top-k most relevant text chunks from the user's collection, including source metadata."""
     try:
         safe_user_id = str(user_id).replace("-", "_")
         collection_name = f"user_{safe_user_id}"
@@ -176,23 +176,36 @@ def search_vdb(user_id: str, subject: str, query: str, k: int = 10) -> List[str]
         if user_collection.count() == 0:
             logger.info(f"Collection {collection_name} is empty.")
             return []
-
         
-        # But if you only want to search the un-foldered files, keep it strictly mapped:
-        #where_clause = {"subject": subject} 
-        
-        #Since root llm outputs root for subjects it cant identify we search all subjects if the subject is root, otherwise we filter by subject
+        # Since root llm outputs root for subjects it cant identify we search all subjects if the subject is root, otherwise we filter by subject
         where_clause = None if subject == "root" else {"subject": subject}
 
+        # Perform the query
         results = user_collection.query(
             query_texts=[query],
             n_results=min(k, user_collection.count()),
             where=where_clause
         )
         
+        # ChromaDB returns parallel arrays. We need both documents AND metadatas!
         documents = results.get("documents", [[]])[0]
-        logger.info(f"Retrieved {len(documents)} chunks from VDB for query: '{query[:30]}...'")
-        return documents
+        metadatas = results.get("metadatas", [[]])[0] 
+        
+        formatted_chunks = []
+        
+        # Zip them together so each text chunk gets matched with its specific metadata
+        for doc, meta in zip(documents, metadatas):
+            # USE "filename" instead of "source" to match your embedding logic
+            source_file = meta.get("filename", "Unknown_File.pdf") if meta else "Unknown_File.pdf"
+            
+            # Grab the chunk index as a location reference instead of a page number
+            chunk_idx = meta.get("chunk_index", "Unknown") if meta else "Unknown"
+            
+            # Format the string: [Source: Physics.pdf (Chunk 4)]
+            formatted_chunks.append(f"[Source: {source_file} (Chunk {chunk_idx})]\n{doc}")
+
+        logger.info(f"Retrieved {len(formatted_chunks)} chunks with sources from VDB for query: '{query[:30]}...'")
+        return formatted_chunks
         
     except Exception as e:
         logger.error(f"Error during VDB search for user {user_id}: {e}")
