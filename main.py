@@ -31,7 +31,11 @@ from models.quiz_generator import QuizGeneratorAgent
 # Load environment variables (.env)
 load_dotenv()
 
-print("Executing table creation in main...")
+if os.getenv("RESET_DB", "False").lower() == "true":
+    #Remove tables and create new tables
+    print("Dropping all tables...")
+    Base.metadata.drop_all(bind=engine)
+    print("Executing table creation in main...")
 # Now that the models are registered, create the tables!
 logger.debug(f"Registered tables before creation: {Base.metadata.tables.keys()}")
 Base.metadata.create_all(bind=engine)
@@ -667,11 +671,18 @@ async def generate_quiz_from_chat(
         db.commit()
         
         # 4. Strip answers before sending to the React frontend
-        sanitized_questions = [
-            {"question": q["question"], "options": q["options"]} 
-            for q in full_quiz_data.get("questions", [])
-        ]
-        
+        sanitized_questions = []
+        for q in full_quiz_data.get("questions", []):
+            # Fallback check for older quizzes that used the "answer" string
+            correct_list = q.get("correct_answers", [q.get("answer")] if q.get("answer") else [])
+            
+            sanitized_questions.append({
+                "question": q["question"], 
+                "options": q["options"],
+                "is_multiple_choice": len(correct_list) > 1 # True if more than 1 answer
+            })
+            
+        # FIX: ADDED MISSING RETURN STATEMENT HERE!
         return success_response(message="Quiz generated successfully!", data={
             "quiz_id": quiz_id,
             "title": full_quiz_data.get("title", "Generated Quiz"),
@@ -785,16 +796,25 @@ async def get_single_quiz(
             return raise_api_error(status_code=404, message="Quiz not found", error_details="Quiz does not exist.")
             
         # Securely sanitize the questions
-        sanitized_questions = [
-            {"question": q["question"], "options": q["options"]} 
-            for q in quiz.full_quiz_data.get("questions", [])
-        ]
+        sanitized_questions = []
         
+        # FIX: CHANGED full_quiz_data TO quiz.full_quiz_data
+        for q in quiz.full_quiz_data.get("questions", []):
+            correct_list = q.get("correct_answers", [q.get("answer")] if q.get("answer") else [])
+            
+            sanitized_questions.append({
+                "question": q["question"], 
+                "options": q["options"],
+                "is_multiple_choice": len(correct_list) > 1 
+            })
+            
+        # FIX: ADDED MISSING RETURN STATEMENT HERE!
         return success_response(message="Quiz loaded", data={
             "quiz_id": quiz.id,
-            "title": quiz.full_quiz_data.get("title"),
+            "title": quiz.full_quiz_data.get("title", "Untitled Quiz"),
             "questions": sanitized_questions
         })
+        
     except Exception as e:
         return raise_api_error(status_code=500, message="Failed to load quiz", error_details=str(e))
 # ==========================================
