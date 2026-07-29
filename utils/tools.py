@@ -10,6 +10,8 @@ import asyncio
 from functools import lru_cache
 import numexpr as ne
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from openai import OpenAI
 from langchain_core.tools import tool
@@ -65,7 +67,7 @@ async def precision_calculator(expression: str) -> str:
 
 # --- 2. Graph Generator ---
 @tool
-async def generate_math_graph(equation: str, x_min: int = -10, x_max: int = 10) -> str:
+async def generate_math_graph(equation: str, x_min: float = -10, x_max: float = 10) -> str:
     """
     Generates a visual graph for a mathematical equation (e.g., 'x**2', 'np.sin(x)').
     Returns a Markdown base64 image link.
@@ -89,8 +91,11 @@ async def generate_math_graph(equation: str, x_min: int = -10, x_max: int = 10) 
         ax.axhline(0, color='black', linewidth=1)
         ax.axvline(0, color='black', linewidth=1)
         
+        # --- THE FIX: Calculate margins before writing to the buffer ---
+        fig.tight_layout()
+        
         buf = io.BytesIO()
-        fig.savefig(buf, format='png', bbox_inches='tight') # save 'fig', not 'plt'
+        fig.savefig(buf, format='png') # save 'fig', removed bbox_inches
         buf.seek(0)
         plt.close(fig) # close this specific figure
         # ------------------------------
