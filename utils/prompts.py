@@ -93,6 +93,7 @@ DOMAIN_TUTOR_PROMPT = ChatPromptTemplate.from_messages([
 ])
 
 # --- Node 7: Answer Composer ---
+#Rewritten question is given so that tool outputs can be included in the final answer. The raw_data is the combined output from tools and retrieved documents.
 COMPOSER_PROMPT = ChatPromptTemplate.from_messages([
     ("system", """You are a Pedagogical Answer Composer for a Study Companion app.
 Your task is to take raw data provided by tools or domain tutors and synthesize it into a clear, engaging, and educational response for the student.
