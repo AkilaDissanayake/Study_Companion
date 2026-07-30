@@ -5,8 +5,10 @@ import datetime
 import mimetypes
 import uuid
 from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Response, Request,Form,BackgroundTasks,Query,Body
+from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from apscheduler.schedulers.background import BackgroundScheduler
 import uvicorn
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
@@ -43,10 +45,56 @@ Base.metadata.create_all(bind=engine)
 # Initialize the isolated logger for this file
 logger = get_logger(__name__, "main.log")
 
+# ==========================================
+# WEEKLY BACKGROUND UPDATER
+# ==========================================
+def run_model_updater():
+    """
+    Runs the Hugging Face update script in a completely isolated subprocess.
+    This ensures that the os.environ overrides in the script DO NOT leak 
+    into the main FastAPI server's memory!
+    """
+    logger.info("[Scheduler] Starting weekly Hugging Face model update check...")
+    try:
+        # sys.executable ensures it uses your exact virtual environment's Python
+        subprocess.run([sys.executable, "utils/cache_models.py"], check=True)
+        logger.info("[Scheduler] Model update check completed successfully.")
+    except Exception as e:
+        logger.error(f"[Scheduler] Model update check failed: {e}")
+
+# ==========================================
+# FASTAPI LIFESPAN MANAGER
+# ==========================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # --- ON STARTUP ---
+    scheduler = BackgroundScheduler()
+    
+    # 1. Fetch from .env, with safe fallbacks just in case the .env is missing
+    update_day = os.getenv("MODEL_UPDATE_DAY", "sun")
+    
+    # 2. Wrap the hour in int() because os.getenv always returns a string ("3" -> 3)
+    try:
+        update_hour = int(os.getenv("MODEL_UPDATE_HOUR", 3))
+    except ValueError:
+        logger.warning("Invalid MODEL_UPDATE_HOUR in .env. Defaulting to 3 AM.")
+        update_hour = 3
+
+    # 3. Inject the dynamic variables into the cron scheduler
+    scheduler.add_job(run_model_updater, 'cron', day_of_week=update_day, hour=update_hour, minute=0)
+    scheduler.start()
+    
+    logger.info(f"Background task scheduler started. Updates scheduled for {update_day.capitalize()} at {update_hour}:00.")
+    
+    yield # The FastAPI server is actively running here
+    
+    # --- ON SHUTDOWN ---
+    scheduler.shutdown()
+    logger.info("Background task scheduler cleanly shut down.")
 
 
 # Initialize FastAPI
-app = FastAPI(title="Study Companion API")
+app = FastAPI(title="Study Companion API",lifespan=lifespan)
 
 # Configure CORS so the Vite React frontend can communicate with FastAPI
 app.add_middleware(

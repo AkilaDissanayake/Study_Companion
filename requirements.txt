@@ -37,3 +37,7 @@ matplotlib
 # --- Web Search ---
 duckduckgo-search
 ddgs
+
+
+# --- Background tasks ---
+apscheduler
