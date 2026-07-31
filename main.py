@@ -7,6 +7,7 @@ import uuid
 from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Response, Request,Form,BackgroundTasks,Query,Body
 from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from apscheduler.schedulers.background import BackgroundScheduler
 import uvicorn
@@ -33,6 +34,16 @@ from models.quiz_generator import QuizGeneratorAgent
 # Load environment variables (.env)
 load_dotenv()
 
+
+
+# Initialize the isolated logger for this file
+logger = get_logger(__name__, "main.log")
+
+Image_dir=os.getenv("IMAGE_DIR","images")
+logger.info(f"Ensuring image directory exists at: {Image_dir}")
+os.makedirs(Image_dir,exist_ok=True)
+
+
 if os.getenv("RESET_DB", "False").lower() == "true":
     #Remove tables and create new tables
     print("Dropping all tables...")
@@ -41,10 +52,6 @@ if os.getenv("RESET_DB", "False").lower() == "true":
 # Now that the models are registered, create the tables!
 logger.debug(f"Registered tables before creation: {Base.metadata.tables.keys()}")
 Base.metadata.create_all(bind=engine)
-
-# Initialize the isolated logger for this file
-logger = get_logger(__name__, "main.log")
-
 # ==========================================
 # WEEKLY BACKGROUND UPDATER
 # ==========================================
@@ -95,7 +102,8 @@ async def lifespan(app: FastAPI):
 
 # Initialize FastAPI
 app = FastAPI(title="Study Companion API",lifespan=lifespan)
-
+#Mount the directory to the FastAPI app for serving images
+app.mount("/generated_images", StaticFiles(directory="images"), name="images")
 # Configure CORS so the Vite React frontend can communicate with FastAPI
 app.add_middleware(
     CORSMiddleware,
