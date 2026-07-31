@@ -15,12 +15,13 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from openai import OpenAI
 from langchain_core.tools import tool
+import uuid
 from utils.vdb_handler import chroma_client
 from utils.logger import get_logger
 
 logger = get_logger(__name__, "tools.log")
 
-
+IMAGE_DIR = os.getenv("IMAGE_DIR", "generated_images")
 # =========================================================
 # LRU CACHED HELPERS
 # =========================================================
@@ -67,49 +68,57 @@ async def precision_calculator(expression: str) -> str:
 
 # --- 2. Graph Generator ---
 @tool
-async def generate_math_graph(equation: str, x_min: float = -10, x_max: float = 10) -> str:
+async def generate_math_graph(equation: str, user_id: str = "guest", x_min: float = -10, x_max: float = 10) -> str:
     """
-    Generates a visual graph for a mathematical equation (e.g., 'x**2', 'np.sin(x)').
-    Returns a Markdown base64 image link.
+    Generates a visual graph for a mathematical equation (e.g., 'x**2', 'sin(x)').
+    Returns a standard URL link to the generated image.
     """
     def _plot():
-        x = np.linspace(x_min, x_max, 400)
-        safe_dict = {
-            "x": x, "np": np, 
-            "sin": np.sin, "cos": np.cos, "tan": np.tan, 
-            "exp": np.exp, "sqrt": np.sqrt, "log": np.log
-        }
-        
-        y = eval(equation, {"__builtins__": None}, safe_dict)
-        
-        # --- THREAD-SAFE MATPLOTLIB ---
-        # Create a specific figure and axis for THIS thread only
-        fig, ax = plt.subplots(figsize=(6, 4))
-        ax.plot(x, y, color="#3498db", linewidth=2)
-        ax.set_title(f"Graph of y = {equation}")
-        ax.grid(True, linestyle='--', alpha=0.7)
-        ax.axhline(0, color='black', linewidth=1)
-        ax.axvline(0, color='black', linewidth=1)
-        
-        # --- THE FIX: Calculate margins before writing to the buffer ---
-        fig.tight_layout()
-        
-        buf = io.BytesIO()
-        fig.savefig(buf, format='png') # save 'fig', removed bbox_inches
-        buf.seek(0)
-        plt.close(fig) # close this specific figure
-        # ------------------------------
-        
-        base64_img = base64.b64encode(buf.getvalue()).decode('utf-8')
-        return f"![Math Graph](data:image/png;base64,{base64_img})"
+        try:
+            # 1. Sanitize common LLM syntax errors before evaluation
+            # Convert JavaScript/Latex style math to Python/NumPy style
+            safe_eq = equation.replace("^", "**") # Fix exponents
+            safe_eq = safe_eq.replace("np.", "") # Strip np. if LLM adds it, we define sin natively
+            
+            x = np.linspace(x_min, x_max, 400)
+            
+            # 2. Evaluate using numexpr for safety and speed over arrays
+            # We define local variables that numexpr can access
+            y = ne.evaluate(safe_eq, local_dict={"x": x})
+            
+            fig, ax = plt.subplots(figsize=(6, 4))
+            ax.plot(x, y, color="#3498db", linewidth=2)
+            ax.set_title(f"Graph of y = {safe_eq}")
+            ax.grid(True, linestyle='--', alpha=0.7)
+            ax.axhline(0, color='black', linewidth=1)
+            ax.axvline(0, color='black', linewidth=1)
+            fig.tight_layout()
+            
+            # 3. Create a specific subdirectory for this user
+            user_folder = os.path.join(IMAGE_DIR, str(user_id))
+            os.makedirs(user_folder, exist_ok=True)
+            
+            # 4. Save the file inside the user's secure folder
+            filename = f"graph_{uuid.uuid4().hex}.png"
+            filepath = os.path.join(user_folder, filename)
+            
+            fig.savefig(filepath, format='png')
+            plt.close(fig) 
+            
+            # 5. Construct the dynamic URL path
+            backend_url = os.getenv("BACKEND_URL", "http://localhost:8000")
+            return f"![Math Graph]({backend_url}/generated_images/{user_id}/{filename})"
+            
+        except Exception as inner_e:
+            # Log the specific error so you can see WHY it crashed in your console
+            logger.error(f"Graphing failed inside _plot thread: {inner_e}")
+            raise inner_e # Re-raise to be caught by the outer try-except
 
     try:
-        # Run CPU-bound Matplotlib rendering off the main thread
         return await asyncio.to_thread(_plot)
     except Exception as e:
-        return f"Error generating graph for '{equation}': {e}. Use standard math notation."
-
-
+        logger.error(f"Outer tool execution failed: {e}")
+        return f"Error generating graph for '{equation}': {e}"
 # --- 3. AI Image Generator ---
 @tool
 async def generate_image(prompt: str, high_quality: bool = False) -> str:
