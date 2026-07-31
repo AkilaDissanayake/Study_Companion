@@ -19,6 +19,8 @@ __pycache__/
 # User-uploaded PDFs
 uploads/
 
+# User generated Images
+images/
 # User configuration files
 configs/
 
