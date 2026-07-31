@@ -30,7 +30,7 @@ def search_and_grade_web(query: str, grader_model: Any, max_results: int = 5) ->
         
         if not raw_web_results:
             raise ValueError("No results found via DuckDuckGo")
-            
+        logger.debug(f"Raw web results: {raw_web_results}") 
         refined_snippets = []
         logger.debug("Raw web structured results received.")
         

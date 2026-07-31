@@ -12,6 +12,7 @@ import math
 import asyncio
 import inspect
 import re
+import os
 from typing import TypedDict, Any
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
@@ -32,12 +33,12 @@ from utils.prompts import (
 from utils.token_manager import log_token_usage
 from utils.web_search import search_and_grade_web
 from utils.logger import get_logger
-
+EMBEDDING_DEVICE = os.getenv("EMBEDDING_DEVICE", "cpu")
 logger = get_logger(__name__, "chatbot.log")
 
 # Load the local Grader Model globally. 
-grader_model = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
-
+logger.info(f"Initializing CRAG Grader Model on device: {EMBEDDING_DEVICE}")
+grader_model = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', device=EMBEDDING_DEVICE)
 
 class TokenTrackingCallbackHandler(BaseCallbackHandler):
     """Listens passively for LLM completion events to decouple token tracking."""
@@ -271,7 +272,6 @@ async def web_search_node(state: AgentState):
         query=state["rewritten_question"], 
         grader_model=grader_model
     )
-    
     if state.get("status") == "AMBIGUOUS":
         new_context = state.get("context", "") + "\n\n" + formatted_web_data
     else:
@@ -323,28 +323,23 @@ async def tool_execution_node(state: AgentState): #async put this out of main ev
         
     tool_map = {tool.name: tool for tool in tools}
     
-    # Worker function to execute a single tool call concurrently
     async def run_single_tool(tool_call):
         tool_name = tool_call["name"]
         tool_args = tool_call["args"].copy()
         
-        # Securely inject user_id from AgentState if required by function signature
-        tool_func = tool_map.get(tool_name)
-        if tool_func:
-            # LangChain stores async tools in .coroutine and sync tools in .func
-            actual_func = tool_func.func or tool_func.coroutine
-            
-            if actual_func:
-                sig = inspect.signature(actual_func)
-                if "user_id" in sig.parameters:
-                    tool_args["user_id"] = state["user_id"]
+        #  Use LangChain's native args_schema instead of inspect
+        tool_instance = tool_map.get(tool_name)
+        if tool_instance:
+            # Check if 'user_id' is a declared parameter in the tool's Pydantic schema
+            if "user_id" in tool_instance.args_schema.__fields__:
+                tool_args["user_id"] = state["user_id"]
                 
         logger.info(f"Executing tool: {tool_name} with args: {tool_args}")
         
-        if tool_name in tool_map:
+        if tool_instance:
             try:
                 # Execute asynchronously
-                result = await tool_map[tool_name].ainvoke(tool_args)
+                result = await tool_instance.ainvoke(tool_args)
                 return f"[Output from {tool_name}]:\n{result}"
             except Exception as e:
                 logger.error(f"Tool {tool_name} execution failed: {e}")
@@ -359,9 +354,9 @@ async def tool_execution_node(state: AgentState): #async put this out of main ev
 
 
 async def answer_composer_node(state: AgentState):
-    """Formats the final text and handles apologies if all data retrievals failed."""
-
+    """Formats the final text natively using the fast LLM, handling standard URLs."""
     logger.info(f"Composing final answer for question: {state['rewritten_question']}")
+    
     if not state.get("is_safe", True):
         override_data = f"Safety Violation Flagged: {state.get('safety_reason')}. Reject the request respectfully."
         
@@ -369,36 +364,23 @@ async def answer_composer_node(state: AgentState):
         override_data = "System Note: Both the textbook database and the external web search failed to find an answer. Politely apologize to the student."
         
     else:
+        # override_data now contains clean strings like "![Graph](http://localhost...)"
         override_data = state.get("raw_data", "No data provided.")
         
-    # ==========================================
-    #  THE BASE64 SHIELD
-    
-    # ==========================================
-    # Find any massive Base64 Markdown images
-    image_pattern = r"(!\[.*?\]\(data:image.*?base64,[^\)]+\))"
-    images = re.findall(image_pattern, override_data)
-    
-    # Replace the massive string with a tiny placeholder for the LLM
-    text_only_data = re.sub(image_pattern, "[IMAGE_PLACEHOLDER]", override_data)
-    
-    tracker = TokenTrackingCallbackHandler(state["user_id"], "gpt-4o-mini-composer")
+    logger.debug(f"Final raw data to compose: {override_data}")
+    # Because we use standard URLs now, the fast LLM handles this easily and cheaply.
+    tracker = TokenTrackingCallbackHandler(state["user_id"], "fast-composer")
     chain = COMPOSER_PROMPT | fast_llm.with_config({"callbacks": [tracker]})
     
-    # Send ONLY the text and the placeholder to the LLM
+    # Send the raw data directly to the LLM
     response = await chain.ainvoke({
-        "raw_data": text_only_data,
+        "raw_data": override_data,
         "rewritten_question": state["rewritten_question"]
     })
     
-    final_text = response.content
+    logger.info("Final answer generated successfully.")
     
-    # Instantly inject the massive Base64 strings back into the final response
-    for img in images:
-        final_text = final_text.replace("[IMAGE_PLACEHOLDER]", img, 1)
-    logger.info(f"Final answer generated. Re-attached {len(images)} images.")
-    
-    return {"final_response": final_text}
+    return {"final_response": response.content}
 
 # --- Routing Edge Logic ---
 #Async not needed since simple operations, no blocking I/O
