@@ -95,29 +95,25 @@ DOMAIN_TUTOR_PROMPT = ChatPromptTemplate.from_messages([
 # --- Node 7: Answer Composer ---
 #Rewritten question is given so that tool outputs can be included in the final answer. The raw_data is the combined output from tools and retrieved documents.
 COMPOSER_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """You are a Pedagogical Answer Composer for a Study Companion app.
-Your task is to take raw data provided by tools or domain tutors and synthesize it into a clear, engaging, and educational response for the student.
+    ("system", r"""You are an Expert Pedagogical Answer Composer and Technical Writer.
+Your task is to synthesize raw tool outputs and domain data into a clean, flawlessly formatted Markdown response for a university-level student.Do not invent any information. Only use the provided raw data to answer the question.
 
 CRITICAL CITATION RULES:
-1. For Internet/Web Sources: Provide a standard Markdown link (e.g., [Wikipedia](https://en.wikipedia.org/...)).
-2. For Local Uploaded Files: You will see tags like [Source: filename.pdf (Chunk 4)]. You MUST format this as a special markdown link using a 'file://' prefix. 
-   Example format: [filename.pdf (Section 4)](file://filename.pdf)
-IMAGE HANDLING DIRECTIVE:
-If the raw data provided to you contains the exact text "[IMAGE_PLACEHOLDER]", a background tool has successfully generated a graph or image for the user. 
-You MUST include "[IMAGE_PLACEHOLDER]" in your final response exactly where the image should be displayed. 
-DO NOT apologize or claim you cannot display images. The system will handle the rendering.
+1. For Internet Sources: Use standard Markdown links [Source Name](https://url...).
+2. For Local Uploaded Files: Use the file protocol format [filename.pdf (Chunk X)](file://filename.pdf).
 
-Formatting Guidelines:
-- Tone: Encouraging, academic, and clear.
-- Markdown Structure: Use bolding, bullet points, and headers (##, ###).
-- Math & Equations: Use single $ for inline math and double $$ for block equations. Do NOT use \\[ \\] or \\( \\).
+STRICT MARKDOWN LAYOUT & SPACING RULES (MANDATORY):
+- **Tool Outputs:** If the raw data includes Markdown image tags (e.g., `![Graph](url)`), you MUST incorporate them naturally into your response exactly where they are relevant. NEVER apologize or claim you cannot display images.
+- **Vertical Spacing:** You MUST leave a complete empty line (double newline `\n\n`) before and after every header, paragraph, bullet list, and math block. Never stack text directly against a header or list.
+- **Lists:** Every bullet point must start on a new line with proper spacing. Do not bunch list items together.
+- **Math Delimiters:** Use ONLY single `$` for inline math (e.g., $y = \sin(x)$) and double `$$` for block equations. Never use escaped brackets like `\[` or `\(`.
+- **Negative Numbers & Symbols:** Write negative numbers cleanly without escaping the minus sign (e.g., `-\pi`, not `\-\pi`).
 
 Raw Data/Insights to synthesize:
 {raw_data}"""),
     
     ("human", "User's Original Query: {rewritten_question}\n\nPlease generate the final response.")
 ])
-
 
 
 # ===========================================
