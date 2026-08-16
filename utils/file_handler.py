@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 from utils.logger import get_logger
 from typing import Generator, Optional
@@ -12,6 +13,22 @@ except ImportError:
 
 # Initialize the isolated logger for this specific file
 logger = get_logger(__name__, "file_handler.log")
+
+# Matches C0 control bytes (NUL, STX, ETX, etc.) excluding \t \n \r.
+# PDFs that use non-standard/symbolic font encodings (common in math or
+# scanned textbooks) sometimes make PyPDF2 emit raw control bytes instead of
+# the intended glyph — left unstripped, these silently propagate into
+# embeddings, chat history, and quiz content, and render as invisible/garbled
+# characters on the frontend.
+_CONTROL_CHARS_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+
+
+def sanitize_text(text: Optional[str]) -> Optional[str]:
+    """Strips non-printable control-byte characters from extracted/stored text."""
+    if not text:
+        return text
+    return _CONTROL_CHARS_RE.sub('', text)
+
 # ==========================================
 # TEXT FILE UTILITIES
 # ==========================================
@@ -78,8 +95,8 @@ def extract_pdf_text(filepath: str) -> Optional[str]:
                 text = page.extract_text()
                 if text:
                     extracted_text.append(text)
-                    
-        return "\n\n".join(extracted_text)
+
+        return sanitize_text("\n\n".join(extracted_text))
         
     except Exception as e:
         logger.error(f"Error reading PDF: {e}")

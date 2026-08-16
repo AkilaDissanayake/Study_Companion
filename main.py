@@ -132,7 +132,7 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None  # None means "create a new chat"
 
 class QuizSubmission(BaseModel):
-    answers: Dict[str, str]
+    answers: Dict[str, List[str]]
 
 class SignupRequest(BaseModel):
     name: str
@@ -938,11 +938,11 @@ async def generate_quiz_from_chat(
             correct_list = q.get("correct_answers", [q.get("answer")] if q.get("answer") else [])
             
             sanitized_questions.append({
-                "question": q["question"], 
-                "options": q["options"],
+                "question": sanitize_text(q["question"]),
+                "options": [sanitize_text(opt) for opt in q["options"]],
                 "is_multiple_choice": len(correct_list) > 1 # True if more than 1 answer
             })
-            
+
         # FIX: ADDED MISSING RETURN STATEMENT HERE!
         return success_response(message="Quiz generated successfully!", data={
             "quiz_id": quiz_id,
@@ -1001,11 +1001,11 @@ async def grade_quiz(
             is_perfect = (user_ans == correct_ans)
             
             results[idx_str] = {
-                "user_answers": list(user_ans),
-                "correct_answers": list(correct_ans),
+                "user_answers": [sanitize_text(a) for a in user_ans],
+                "correct_answers": [sanitize_text(a) for a in correct_ans],
                 "is_correct": is_perfect,
                 "points_awarded": round(q_score, 2), # Send partial points to frontend
-                "explanation": q["explanation"]
+                "explanation": sanitize_text(q["explanation"])
             }
 
         return success_response(message="Quiz graded!", data={
@@ -1064,20 +1064,46 @@ async def get_single_quiz(
             correct_list = q.get("correct_answers", [q.get("answer")] if q.get("answer") else [])
             
             sanitized_questions.append({
-                "question": q["question"], 
-                "options": q["options"],
-                "is_multiple_choice": len(correct_list) > 1 
+                "question": sanitize_text(q["question"]),
+                "options": [sanitize_text(opt) for opt in q["options"]],
+                "is_multiple_choice": len(correct_list) > 1
             })
-            
+
         # ADDED MISSING RETURN STATEMENT HERE
         return success_response(message="Quiz loaded", data={
             "quiz_id": quiz.id,
             "title": quiz.full_quiz_data.get("title", "Untitled Quiz"),
             "questions": sanitized_questions
         })
-        
+
     except Exception as e:
         return raise_api_error(status_code=500, message="Failed to load quiz", error_details=str(e))
+
+
+@app.delete("/quizzes/{quiz_id}")
+async def delete_quiz(
+    quiz_id: str,
+    user_id: str = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """Deletes a specific quiz for the authenticated user."""
+    logger.info(f"Deleting quiz_id: {quiz_id} for user_id: {user_id}")
+
+    quiz = db.query(QuizRecord).filter(
+        QuizRecord.id == quiz_id, QuizRecord.user_id == user_id
+    ).first()
+
+    if not quiz:
+        logger.warning(f"Quiz not found or unauthorized delete attempt: quiz_id={quiz_id}, user_id={user_id}")
+        raise_api_error(status_code=404, message="Quiz not found", error_details=f"The quiz '{quiz_id}' does not exist or you do not have permission to access it.")
+
+    db.delete(quiz)
+    db.commit()
+
+    logger.info(f"Successfully deleted quiz_id: {quiz_id}")
+    return success_response(message="Quiz deleted successfully")
+
+
 # ==========================================
 # SERVER EXECUTION
 # ==========================================
