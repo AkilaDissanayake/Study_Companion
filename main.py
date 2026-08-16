@@ -31,6 +31,7 @@ from utils.database_handler import engine, Base
 from utils import db_models
 from utils.security import hash_password, verify_password, generate_token
 from utils.email_handler import send_verification_email, send_password_reset_email
+from utils.pricing_handler import get_pricing_tiers
 from models.chatbot import ChatBot
 from models.quiz_generator import QuizGeneratorAgent
 # Load environment variables (.env)
@@ -387,6 +388,22 @@ async def check_auth(user_id: str = Depends(get_current_user_from_cookie), db: S
 class ConfigPayload(BaseModel):
     filename: str
     data: Dict[str, Any]
+
+
+# ==========================================
+# PRICING API (public, no auth — hand-edited pricing.yaml)
+# ==========================================
+
+@app.get("/pricing")
+async def get_pricing():
+    """Serves the hand-edited pricing config for the landing page. No auth,
+    no DB — plan/trial tracking and quota enforcement are separate, later work."""
+    try:
+        config = get_pricing_tiers()
+        return success_response(message="Pricing retrieved", data=config)
+    except Exception as e:
+        logger.exception("Failed to load pricing config")
+        raise_api_error(status_code=500, message="Failed to load pricing", error_details=e)
 
 
 # ==========================================

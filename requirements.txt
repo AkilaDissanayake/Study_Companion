@@ -11,6 +11,7 @@ requests
 PyJWT
 bcrypt
 email-validator
+PyYAML
 
 # --- File Processing ---
 PyPDF2

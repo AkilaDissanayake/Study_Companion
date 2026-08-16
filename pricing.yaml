@@ -1,0 +1,43 @@
+# Pricing configuration for the Study Companion landing page.
+# Edit this file by hand to change prices/features — no restart required,
+# GET /pricing re-reads it on every request.
+#
+# `highlighted: true` marks the tier visually emphasized on the pricing page.
+# `cta_label` is the button text shown on that tier's card.
+
+tiers:
+  - id: trial
+    name: Free Trial
+    price: 0
+    currency: USD
+    billing_period: "14 days"
+    cta_label: "Start Free Trial"
+    highlighted: false
+    features:
+      - "Full access to AI tutoring"
+      - "Upload your study materials"
+      - "Generate quizzes from any chat"
+
+  - id: pro
+    name: Pro
+    price: 9.99
+    currency: USD
+    billing_period: month
+    cta_label: "Get Started"
+    highlighted: true
+    features:
+      - "Everything in Free Trial"
+      - "Unlimited document uploads"
+      - "Unlimited quizzes"
+
+  - id: team
+    name: Team
+    price: 29.99
+    currency: USD
+    billing_period: month
+    cta_label: "Contact Sales"
+    highlighted: false
+    features:
+      - "Everything in Pro"
+      - "Multiple seats"
+      - "Priority support"
