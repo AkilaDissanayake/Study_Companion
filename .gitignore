@@ -35,3 +35,9 @@ logs/
 # =========================
 # Vector database files
 vectorstore/
+
+# MD file
+backend-README.md
+
+#Diagrams
+Untitled Diagram.drawio
