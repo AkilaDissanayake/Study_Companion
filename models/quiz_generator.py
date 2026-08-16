@@ -103,3 +103,12 @@ workflow.add_conditional_edges(
 
 # Compile the engine
 QuizGeneratorAgent = workflow.compile()
+
+
+# Visualization Export
+try:
+    with open("quiz_generator.png", "wb") as f:
+        f.write(QuizGeneratorAgent.get_graph().draw_mermaid_png())
+    logger.info("Successfully saved LangGraph architecture as quiz_generator.png")
+except Exception as e:
+    logger.warning(f"Could not save graph PNG: {e}")

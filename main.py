@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from apscheduler.schedulers.background import BackgroundScheduler
 import uvicorn
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 from typing import Dict, Any, List, Optional
 from google.oauth2 import id_token
 from google.auth.transport import requests
@@ -25,10 +25,12 @@ from utils.json_handler import *
 from utils.file_handler import *
 from utils.vdb_handler import embed_uploaded_file,delete_file_from_vdb,delete_subject_from_vdb
 from utils.database_handler import engine, Base,get_db
-from utils.db_models import TokenUsage, ChatSession,QuizRecord
-from utils.response_handler import success_response, raise_api_error 
+from utils.db_models import TokenUsage, ChatSession, QuizRecord, User
+from utils.response_handler import success_response, raise_api_error
 from utils.database_handler import engine, Base
-from utils import db_models 
+from utils import db_models
+from utils.security import hash_password, verify_password, generate_token
+from utils.email_handler import send_verification_email, send_password_reset_email
 from models.chatbot import ChatBot
 from models.quiz_generator import QuizGeneratorAgent
 # Load environment variables (.env)
@@ -49,7 +51,7 @@ if os.getenv("RESET_DB", "False").lower() == "true":
     print("Dropping all tables...")
     Base.metadata.drop_all(bind=engine)
     print("Executing table creation in main...")
-# Now that the models are registered, create the tables!
+# Now that the models are registered, create the tables
 logger.debug(f"Registered tables before creation: {Base.metadata.tables.keys()}")
 Base.metadata.create_all(bind=engine)
 # ==========================================
@@ -116,7 +118,11 @@ app.add_middleware(
 logger.info("FastAPI application successfully started.")
 
 # Secure Keys from .env
-SECRET_KEY = os.getenv("JWT_SECRET_KEY", "super-secret-key-change-me")
+SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+if not SECRET_KEY:
+    raise RuntimeError(
+        "JWT_SECRET_KEY is not set in the environment. Refusing to start with an insecure default."
+    )
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 
 #Classes
@@ -127,6 +133,25 @@ class ChatRequest(BaseModel):
 class QuizSubmission(BaseModel):
     answers: Dict[str, str]
 
+class SignupRequest(BaseModel):
+    name: str
+    email: EmailStr
+    password: str
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+class VerifyEmailRequest(BaseModel):
+    token: str
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
+
 
 # ==========================================
 # AUTHENTICATION & JWT LOGIC
@@ -135,15 +160,15 @@ class QuizSubmission(BaseModel):
 async def get_current_user_from_cookie(request: Request) -> str:
     """Dependency to extract user_id securely from the HttpOnly Cookie."""
     token = request.cookies.get("session_token")
-    
+
     if not token:
         logger.warning("Rejected request: Missing session token cookie.")
         raise_api_error(status_code=401, message="Not authenticated. Missing session token.")
-        
+
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
         return payload["sub"]
-        
+
     except jwt.ExpiredSignatureError:
         logger.warning("Rejected request: Session token expired.")
         raise_api_error(status_code=401, message="Session token has expired. Please log in again.")
@@ -152,42 +177,184 @@ async def get_current_user_from_cookie(request: Request) -> str:
         raise_api_error(status_code=401, message="Invalid or tampered token detected.")
 
 
+def issue_session_cookie(response: Response, user_id: str):
+    """Issues the shared 7-day session cookie used by both the Google and
+    email/password login flows."""
+    jwt_payload = {
+        "sub": user_id,
+        "exp": datetime.datetime.utcnow() + datetime.timedelta(days=7)
+    }
+    custom_jwt = jwt.encode(jwt_payload, SECRET_KEY, algorithm="HS256")
+    response.set_cookie(
+        key="session_token",
+        value=custom_jwt,
+        httponly=True,
+        secure=True,
+        samesite="lax"
+    )
+
+
 @app.post("/login/google")
-async def login_with_google(token: str, response: Response):
-    """Verifies Google token, retrieves config, and sets a 7-day secure cookie."""
+async def login_with_google(token: str, response: Response, db: Session = Depends(get_db)):
+    """Verifies Google token, gets/creates the local User record, retrieves
+    config, and sets a 7-day secure cookie."""
     try:
         # 1. Verify Google Identity
         id_info = id_token.verify_oauth2_token(token, requests.Request(), GOOGLE_CLIENT_ID)
         user_id = id_info.get("sub")
-        
-        # 2. Get/Create User Config
+        email = id_info.get("email")
+        name = id_info.get("name") or (email.split("@")[0] if email else "User")
+
+        # 2. Get or create the local User record for this Google account
+        user = db.query(User).filter(User.google_id == user_id).first()
+        if not user:
+            # A different account (local email/password signup) may already
+            # own this email — do not silently merge identities.
+            existing = db.query(User).filter(User.email == email).first()
+            if existing:
+                raise_api_error(
+                    status_code=409,
+                    message="This email is already registered with a password. Please sign in with your password instead.",
+                )
+            user = User(
+                id=user_id,
+                email=email,
+                name=name,
+                google_id=user_id,
+                password_hash=None,
+                is_email_verified=True,  # Google has already verified this email
+            )
+            db.add(user)
+            db.commit()
+            logger.info(f"Created new local User record for Google account {user_id}.")
+
+        # 3. Get/Create User Config
         config_file = f"{user_id}.json"
         user_config = read_config(config_file, default_fallback={"theme": "light"})
-        
-        # 3. Issue Custom JWT valid for 7 days
-        jwt_payload = {
-            "sub": user_id,
-            "exp": datetime.datetime.utcnow() + datetime.timedelta(days=7)
-        }
-        custom_jwt = jwt.encode(jwt_payload, SECRET_KEY, algorithm="HS256")
-        
-        # 4. Set Secure HttpOnly Cookie
-        response.set_cookie(
-            key="session_token", 
-            value=custom_jwt, 
-            httponly=True,  
-            secure=True,    
-            samesite="lax"
-        )
-        
-        logger.info(f"User {user_id} successfully logged in.")
+
+        # 4. Issue the shared session cookie
+        issue_session_cookie(response, user_id)
+
+        logger.info(f"User {user_id} successfully logged in via Google.")
         return success_response(
-            message="Login successful", 
-            data={"user_id": user_id, "config": user_config}
+            message="Login successful",
+            data={"user_id": user_id, "email": user.email, "name": user.name, "config": user_config}
         )
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise_api_error(status_code=401, message="Invalid Google token", error_details=e)
+
+
+@app.post("/auth/signup")
+async def signup(payload: SignupRequest, db: Session = Depends(get_db)):
+    """Creates a new email/password account and emails a verification link.
+    Does not log the user in — they must verify their email first."""
+    try:
+        existing = db.query(User).filter(User.email == payload.email).first()
+        if existing:
+            method = "Google sign-in" if existing.password_hash is None else "your password"
+            raise_api_error(status_code=409, message=f"This email is already registered. Please sign in with {method}.")
+
+        token = generate_token()
+        user = User(
+            id=str(uuid.uuid4()),
+            email=payload.email,
+            name=payload.name,
+            password_hash=hash_password(payload.password),
+            google_id=None,
+            is_email_verified=False,
+            email_verification_token=token,
+            email_verification_expires=datetime.datetime.utcnow() + datetime.timedelta(hours=24),
+        )
+        db.add(user)
+        db.commit()
+
+        send_verification_email(user.email, token)
+        logger.info(f"New local signup for {user.email}; verification email sent.")
+        return success_response(message="Account created. Please check your email to verify your account.")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise_api_error(status_code=500, message="Failed to create account", error_details=e)
+
+
+@app.post("/auth/verify-email")
+async def verify_email(payload: VerifyEmailRequest, db: Session = Depends(get_db)):
+    """Marks an account's email as verified using the token from the emailed link."""
+    user = db.query(User).filter(User.email_verification_token == payload.token).first()
+    if not user or not user.email_verification_expires or user.email_verification_expires < datetime.datetime.utcnow():
+        raise_api_error(status_code=400, message="This verification link is invalid or has expired.")
+
+    user.is_email_verified = True
+    user.email_verification_token = None
+    user.email_verification_expires = None
+    db.commit()
+
+    logger.info(f"Email verified for user {user.id}.")
+    return success_response(message="Email verified successfully. You can now log in.")
+
+
+@app.post("/login")
+async def login_with_password(payload: LoginRequest, response: Response, db: Session = Depends(get_db)):
+    """Authenticates an email/password account and sets the shared session cookie."""
+    user = db.query(User).filter(User.email == payload.email).first()
+
+    if not user or not user.password_hash:
+        raise_api_error(status_code=401, message="Invalid email or password.")
+
+    if not verify_password(payload.password, user.password_hash):
+        raise_api_error(status_code=401, message="Invalid email or password.")
+
+    if not user.is_email_verified:
+        raise_api_error(status_code=403, message="Please verify your email before logging in.")
+
+    issue_session_cookie(response, user.id)
+
+    config_file = f"{user.id}.json"
+    user_config = read_config(config_file, default_fallback={"theme": "light"})
+
+    logger.info(f"User {user.id} successfully logged in via password.")
+    return success_response(
+        message="Login successful",
+        data={"user_id": user.id, "email": user.email, "name": user.name, "config": user_config}
+    )
+
+
+@app.post("/auth/forgot-password")
+async def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db)):
+    """Always returns the same generic response to avoid leaking whether an
+    email is registered. Only sends an email for local (password-based) accounts."""
+    user = db.query(User).filter(User.email == payload.email).first()
+    if user and user.password_hash:
+        token = generate_token()
+        user.password_reset_token = token
+        user.password_reset_expires = datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+        db.commit()
+        send_password_reset_email(user.email, token)
+        logger.info(f"Password reset requested for user {user.id}.")
+
+    return success_response(message="If an account with that email exists, a password reset link has been sent.")
+
+
+@app.post("/auth/reset-password")
+async def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db)):
+    """Sets a new password using the token from the emailed reset link."""
+    user = db.query(User).filter(User.password_reset_token == payload.token).first()
+    if not user or not user.password_reset_expires or user.password_reset_expires < datetime.datetime.utcnow():
+        raise_api_error(status_code=400, message="This password reset link is invalid or has expired.")
+
+    user.password_hash = hash_password(payload.new_password)
+    user.password_reset_token = None
+    user.password_reset_expires = None
+    db.commit()
+
+    logger.info(f"Password reset completed for user {user.id}.")
+    return success_response(message="Password reset successfully. You can now log in with your new password.")
+
 
 @app.post("/login/logout")
 async def logout_user(response: Response):
@@ -195,17 +362,23 @@ async def logout_user(response: Response):
     Clears the HttpOnly cookie to securely log the user out.
     """
     response.delete_cookie(
-        "session_token", 
-        httponly=True, 
+        "session_token",
+        httponly=True,
         samesite="lax"
     )
     logger.info("User successfully logged out and cookie cleared.")
     return success_response(message="Logged out successfully")
 
 @app.get("/auth/check")
-async def check_auth(user_id: str = Depends(get_current_user_from_cookie)):
+async def check_auth(user_id: str = Depends(get_current_user_from_cookie), db: Session = Depends(get_db)):
     """Validates the session cookie on page refresh."""
-    return {"authenticated": True, "user_id": user_id}
+    user = db.query(User).filter(User.id == user_id).first()
+    return {
+        "authenticated": True,
+        "user_id": user_id,
+        "email": user.email if user else None,
+        "name": user.name if user else None,
+    }
 
 # ==========================================
 # PYDANTIC MODELS (For JSON Body Validation)
@@ -479,40 +652,55 @@ async def delete_user_subject(
     data: dict = Body(...),
     user_id: str = Depends(get_current_user_from_cookie)
 ):
-
     """
-    Securely deletes an uploaded file.
+    Securely deletes a subject folder, its vector DB entries, and configuration.
     Prevents directory traversal attacks by reconstructing the path strictly within the user's directory.
     """
     try:
         subject = data.get("subject")
         
-        # Reconstruct the base path based on whether the file is in a subject folder or root
-        if subject!="root" : #No button for root folder
-            file_path = os.path.join("uploads", user_id, subject)
+        #  Validation: Ensure subject was actually provided
+        if not subject:
+            return raise_api_error(status_code=400, message="Subject name is required.")
+            
+        #  Security: Strictly prevent directory traversal attacks (e.g., subject="../another_user")
+        if "/" in subject or "\\" in subject or ".." in subject:
+             return raise_api_error(status_code=400, message="Invalid subject name.")
+
+        #  Main Logic
+        if subject != "root":
             # Delete from upload dir
-            pdf_status=delete_directory(file_path)
+            file_path = os.path.join("uploads", user_id, subject)
+            pdf_status = delete_directory(file_path)
+            
             # Delete from vdb
-            vdb_status=delete_subject_from_vdb(user_id,subject)
-            #After deleting subject we need to remove that subject from config file
-            file_name=f"{user_id}.json"
-            subjects=read_config(file_name).get("subjects")
+            vdb_status = delete_subject_from_vdb(user_id, subject)
+            
+            # Read config safely, defaulting to an empty list if 'subjects' doesn't exist
+            file_name = f"{user_id}.json"
+            config_data = read_config(file_name) or {}
+            subjects = config_data.get("subjects", [])
+            
+            # Safely remove and update
             if subject in subjects:
                 subjects.remove(subject)
-            new_data={"subjects":subjects}
-            
-            update_config(file_name,new_data)
+                # Ensure we don't overwrite other unrelated data in the config
+                config_data["subjects"] = subjects
+                update_config(file_name, config_data)
+                
+            return success_response(message=f"Subject '{subject}' successfully deleted.")
             
         else:
+            #  Prevent deletion of the 'root' folder
+            return raise_api_error(
+                status_code=403, 
+                message="You do not have permission to delete the 'root' folder."
+            )
             
-            file_path=os.path.join("uploads",user_id)
-            pdf_status=delete_directory(file_path)
-            # Delete from vdb
-            vdb_status=delete_subject_from_vdb(user_id,"root")
-        return success_response(message=f"Subject '{subject}' successfully deleted.")
     except Exception as e:
-        raise_api_error(status_code=500, message="Failed to delete subject", error_details=e)
-
+        #   Handle any error occcuring during deletion
+        
+        return raise_api_error(status_code=500, message="Failed to delete subject", error_details=e)
 
 # ==========================================
 # Chat API
@@ -864,7 +1052,7 @@ async def get_single_quiz(
                 "is_multiple_choice": len(correct_list) > 1 
             })
             
-        # FIX: ADDED MISSING RETURN STATEMENT HERE!
+        # ADDED MISSING RETURN STATEMENT HERE
         return success_response(message="Quiz loaded", data={
             "quiz_id": quiz.id,
             "title": quiz.full_quiz_data.get("title", "Untitled Quiz"),

@@ -9,6 +9,8 @@ python-dotenv
 google-auth
 requests
 PyJWT
+bcrypt
+email-validator
 
 # --- File Processing ---
 PyPDF2

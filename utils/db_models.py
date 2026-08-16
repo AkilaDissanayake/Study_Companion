@@ -8,11 +8,41 @@ PostgreSQL JSONB conversational storage tables.
 """
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, Integer, DateTime,ForeignKey,JSON
-from sqlalchemy.dialects.postgresql import JSONB, ARRAY  
+from sqlalchemy import Column, String, Integer, Boolean, DateTime,ForeignKey,JSON
+from sqlalchemy.dialects.postgresql import JSONB, ARRAY
 from sqlalchemy.sql import func
 
 from utils.database_handler import Base
+
+
+class User(Base):
+    """
+    Represents an account holder, created either via Google Sign-In or via
+    email/password signup. Both auth methods share this single table:
+    `password_hash` is NULL for Google-only accounts, `google_id` is NULL
+    for local (email/password) accounts.
+
+    `id` is the Google `sub` claim for Google-created accounts (preserving
+    the identifier every other table already keys `user_id` on) or a
+    generated uuid4 for local signups.
+    """
+    __tablename__ = "users"
+
+    id = Column(String, primary_key=True)
+    email = Column(String, unique=True, index=True, nullable=False)
+    name = Column(String, nullable=False)
+    password_hash = Column(String, nullable=True)
+    google_id = Column(String, unique=True, index=True, nullable=True)
+
+    is_email_verified = Column(Boolean, default=False, nullable=False)
+    email_verification_token = Column(String, nullable=True)
+    email_verification_expires = Column(DateTime, nullable=True)
+    password_reset_token = Column(String, nullable=True)
+    password_reset_expires = Column(DateTime, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
 
 class TokenUsage(Base):
     """
