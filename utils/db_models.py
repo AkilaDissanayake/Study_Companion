@@ -8,7 +8,7 @@ PostgreSQL JSONB conversational storage tables.
 """
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, Integer, Boolean, DateTime,ForeignKey,JSON
+from sqlalchemy import Column, String, Integer, Boolean, DateTime,ForeignKey,JSON, Float, Text
 from sqlalchemy.dialects.postgresql import JSONB, ARRAY
 from sqlalchemy.sql import func
 
@@ -110,3 +110,32 @@ class UserStats(Base):
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+class Flashcard(Base):
+    """
+    A single spaced-repetition card, reviewed via the classic SM-2 algorithm
+    (ease_factor/interval_days/repetitions — see utils/srs_handler.py).
+    Fed from two sources into one shared review queue: an AI-generated deck
+    parsed from an uploaded file (source="upload", source_ref=filename), or
+    automatically when a quiz question is answered wrong
+    (source="quiz", source_ref=quiz_id) — see the grading hook in main.py's
+    /quizzes/{quiz_id}/grade.
+    """
+    __tablename__ = "flashcards"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String, index=True, nullable=False)
+    subject = Column(String, nullable=True)
+    front = Column(Text, nullable=False)
+    back = Column(Text, nullable=False)
+    source = Column(String, nullable=False)       # "upload" | "quiz"
+    source_ref = Column(String, nullable=True)     # filename (upload) or quiz_id (quiz)
+
+    ease_factor = Column(Float, default=2.5, nullable=False)
+    interval_days = Column(Float, default=0, nullable=False)
+    repetitions = Column(Integer, default=0, nullable=False)
+    next_review_at = Column(DateTime(timezone=True), nullable=False)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

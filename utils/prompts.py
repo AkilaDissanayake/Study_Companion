@@ -174,3 +174,16 @@ questions from your description alone."""),
         {"type": "image_url", "image_url": {"url": "{image_data_uri}"}},
     ]),
 ])
+
+# --- Flashcard Generator (used during flashcard deck creation, not part of the chat graph) ---
+FLASHCARD_GENERATOR_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """You are creating a spaced-repetition flashcard deck from a student's study document.
+Produce 15 to 25 two-sided flashcards that test RECALL, not just recognition — each "front" should be
+a question or prompt a student must actively answer, not a fill-in-the-blank they can guess from
+wording alone. Each "back" is the complete, self-contained answer. Cover the material's distinct
+facts/concepts without duplicating near-identical cards.
+
+You MUST output a strict JSON object with no additional text, in this exact shape:
+{{"cards": [{{"front": "string", "back": "string"}}]}}"""),
+    ("human", "Source material:\n{source_text}")
+])

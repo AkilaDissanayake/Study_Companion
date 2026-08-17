@@ -25,7 +25,7 @@ from utils.json_handler import *
 from utils.file_handler import *
 from utils.vdb_handler import embed_uploaded_file,delete_file_from_vdb,delete_subject_from_vdb
 from utils.database_handler import engine, Base,get_db
-from utils.db_models import TokenUsage, ChatSession, QuizRecord, User, UserStats
+from utils.db_models import TokenUsage, ChatSession, QuizRecord, User, UserStats, Flashcard
 from utils.response_handler import success_response, raise_api_error
 from utils.database_handler import engine, Base
 from utils import db_models
@@ -33,6 +33,8 @@ from utils.security import hash_password, verify_password, generate_token
 from utils.email_handler import send_verification_email, send_password_reset_email
 from utils.pricing_handler import get_pricing_tiers
 from utils.stats_handler import get_stats_summary, ack_milestone
+from utils.srs_handler import create_flashcards, schedule_wrong_quiz_answer, get_due_cards, apply_sm2_review, QUALITY_MAP
+from utils.flashcard_generator import generate_flashcards_from_text
 from models.chatbot import ChatBot
 from models.quiz_generator import QuizGeneratorAgent
 # Load environment variables (.env)
@@ -157,6 +159,13 @@ class ResetPasswordRequest(BaseModel):
 class AckMilestoneRequest(BaseModel):
     type: str  # "streak" | "badge"
     id: str
+
+class GenerateFlashcardsRequest(BaseModel):
+    filename: str
+    subject: str = "root"
+
+class FlashcardReviewRequest(BaseModel):
+    rating: str  # "again" | "hard" | "good" | "easy"
 
 
 # ==========================================
@@ -1004,7 +1013,21 @@ async def grade_quiz(
             
             # 3. Check if it was perfectly answered for the UI styling
             is_perfect = (user_ans == correct_ans)
-            
+
+            # Long-term retention hook: a wrong answer is automatically
+            # scheduled into the spaced-repetition queue, 1 day out — see
+            # utils/srs_handler.py. Best-effort: a scheduling hiccup should
+            # never block the user from seeing their quiz results.
+            if not is_perfect:
+                try:
+                    schedule_wrong_quiz_answer(
+                        db, user_id, quiz_id,
+                        front=q["question"],
+                        back=", ".join(correct_ans) + " — " + q["explanation"],
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to schedule SRS card for quiz {quiz_id} question {idx}: {e}")
+
             results[idx_str] = {
                 "user_answers": [sanitize_text(a) for a in user_ans],
                 "correct_answers": [sanitize_text(a) for a in correct_ans],
@@ -1107,6 +1130,160 @@ async def delete_quiz(
 
     logger.info(f"Successfully deleted quiz_id: {quiz_id}")
     return success_response(message="Quiz deleted successfully")
+
+
+# ==========================================
+# FLASHCARDS API (spaced repetition — SM-2)
+# ==========================================
+
+@app.post("/flashcards/generate")
+async def generate_flashcards(
+    payload: GenerateFlashcardsRequest,
+    user_id: str = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """Parses an already-uploaded file and generates an AI flashcard deck
+    from it, due for review immediately."""
+    try:
+        subject = payload.subject or "root"
+        if subject == "root":
+            file_path = os.path.join("uploads", user_id, payload.filename)
+        else:
+            file_path = os.path.join("uploads", user_id, subject, payload.filename)
+
+        # Same directory-traversal guard as /files/download.
+        normalized_path = os.path.normpath(file_path)
+        if not normalized_path.startswith("uploads"):
+            return raise_api_error(status_code=400, message="Security Alert: Invalid file path sequence.")
+
+        if not os.path.exists(normalized_path):
+            return raise_api_error(status_code=404, message="File not found.")
+
+        if normalized_path.lower().endswith(".pdf"):
+            raw_text = extract_pdf_text(normalized_path)
+        elif normalized_path.lower().endswith(".txt"):
+            raw_text = read_text(normalized_path)
+        else:
+            return raise_api_error(status_code=400, message="Unsupported file type for flashcard generation.")
+
+        if not raw_text:
+            return raise_api_error(status_code=422, message="No readable text found in this file.")
+
+        cards = generate_flashcards_from_text(raw_text, user_id)
+        if not cards:
+            return raise_api_error(status_code=422, message="Could not generate flashcards from this file.")
+
+        created_count = create_flashcards(
+            db, user_id, source="upload", cards=cards,
+            subject=None if subject == "root" else subject,
+            source_ref=payload.filename,
+        )
+
+        return success_response(message=f"Generated {created_count} flashcards.", data={"created": created_count})
+    except Exception as e:
+        logger.exception(f"Failed to generate flashcards for user {user_id}")
+        return raise_api_error(status_code=500, message="Failed to generate flashcards", error_details=str(e))
+
+
+@app.get("/flashcards/due")
+async def get_due_flashcards(
+    user_id: str = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """Cards due for review right now, oldest-due-first."""
+    try:
+        cards = get_due_cards(db, user_id)
+        data = [
+            {"id": c.id, "front": c.front, "back": c.back, "subject": c.subject, "source": c.source}
+            for c in cards
+        ]
+        return success_response(message="Due flashcards fetched", data=data)
+    except Exception as e:
+        return raise_api_error(status_code=500, message="Failed to fetch due flashcards", error_details=str(e))
+
+
+@app.post("/flashcards/{card_id}/review")
+async def review_flashcard(
+    card_id: str,
+    payload: FlashcardReviewRequest,
+    user_id: str = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """Applies an SM-2 review update (Again/Hard/Good/Easy) to one card."""
+    try:
+        quality = QUALITY_MAP.get(payload.rating)
+        if quality is None:
+            return raise_api_error(status_code=400, message="rating must be one of: again, hard, good, easy")
+
+        card = db.query(Flashcard).filter(Flashcard.id == card_id, Flashcard.user_id == user_id).first()
+        if not card:
+            return raise_api_error(status_code=404, message="Flashcard not found")
+
+        update = apply_sm2_review(card.ease_factor, card.interval_days, card.repetitions, quality)
+        card.ease_factor = update["ease_factor"]
+        card.interval_days = update["interval_days"]
+        card.repetitions = update["repetitions"]
+        card.next_review_at = update["next_review_at"]
+        db.commit()
+
+        return success_response(message="Card reviewed", data={
+            "id": card.id,
+            "interval_days": card.interval_days,
+            "next_review_at": card.next_review_at,
+        })
+    except Exception as e:
+        return raise_api_error(status_code=500, message="Failed to review flashcard", error_details=str(e))
+
+
+@app.get("/flashcards")
+async def get_all_flashcards(
+    user_id: str = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """Lists every flashcard for the management/decks view (frontend groups by subject/source_ref)."""
+    try:
+        cards = db.query(Flashcard).filter(Flashcard.user_id == user_id).order_by(Flashcard.created_at.desc()).all()
+        data = [
+            {
+                "id": c.id, "front": c.front, "back": c.back, "subject": c.subject,
+                "source": c.source, "source_ref": c.source_ref,
+                "next_review_at": c.next_review_at, "repetitions": c.repetitions,
+            }
+            for c in cards
+        ]
+        return success_response(message="Flashcards fetched", data=data)
+    except Exception as e:
+        return raise_api_error(status_code=500, message="Failed to fetch flashcards", error_details=str(e))
+
+
+@app.delete("/flashcards/deck")
+async def delete_flashcard_deck(
+    source_ref: str = Query(..., description="The deck to delete — a filename (upload decks) or quiz_id (quiz decks)"),
+    user_id: str = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """Bulk-deletes every flashcard belonging to one generated deck. Must be
+    registered before /flashcards/{card_id} so 'deck' isn't captured as a card_id path param."""
+    deleted = db.query(Flashcard).filter(
+        Flashcard.user_id == user_id, Flashcard.source_ref == source_ref
+    ).delete(synchronize_session=False)
+    db.commit()
+    return success_response(message=f"Deleted {deleted} flashcards.")
+
+
+@app.delete("/flashcards/{card_id}")
+async def delete_flashcard(
+    card_id: str,
+    user_id: str = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """Deletes a single flashcard for the authenticated user."""
+    card = db.query(Flashcard).filter(Flashcard.id == card_id, Flashcard.user_id == user_id).first()
+    if not card:
+        return raise_api_error(status_code=404, message="Flashcard not found")
+    db.delete(card)
+    db.commit()
+    return success_response(message="Flashcard deleted")
 
 
 # ==========================================
