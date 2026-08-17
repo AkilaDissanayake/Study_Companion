@@ -157,3 +157,20 @@ QUIZ_CRITIC_PROMPT = ChatPromptTemplate.from_messages([
     2. If ANY question contains hallucinations or relies on outside knowledge, output a natural language critique explaining exactly which question failed and why it is not supported by the text. Do not output JSON."""),
     ("human", "Chat History:\n{history}\n\nDraft Quiz:\n{draft_quiz}")
 ])
+
+# --- Image Captioner (used during PDF ingestion, not part of the chat graph) ---
+# Describes an image embedded in an uploaded PDF page so it becomes searchable
+# text in the vector store instead of silently dropped content (see
+# utils/image_captioner.py and utils/file_handler.py's extract_pdf_text).
+IMAGE_CAPTION_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """You are describing an image extracted from a student's study document
+for a knowledge base an AI tutor will search. Write a highly detailed, literal description:
+if it's a diagram, describe every labeled part and how they relate; if it's a chart/graph,
+state the axes, series, and approximate values; if it's a table rendered as an image,
+transcribe it as text; if it's a mathematical figure or equation, transcribe the notation
+precisely. Do not editorialize or summarize loosely — a student should be able to answer
+questions from your description alone."""),
+    ("human", [
+        {"type": "image_url", "image_url": {"url": "{image_data_uri}"}},
+    ]),
+])

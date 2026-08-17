@@ -10,6 +10,17 @@ try:
 except ImportError:
     PyPDF2 = None
 
+from utils.image_captioner import caption_image
+
+# Skips tiny decorative icons/bullets/logos — a raw-byte-size heuristic
+# rather than pixel dimensions, so this doesn't need a Pillow dependency
+# just to check image size.
+MIN_IMAGE_BYTES = 3000
+# Cost/latency safety valve: this codebase has no rate-limit/retry infra to
+# lean on otherwise, so a pathological PDF (hundreds of embedded images)
+# can't turn into hundreds of sequential vision-LLM calls.
+MAX_IMAGES_PER_DOC = 20
+
 
 # Initialize the isolated logger for this specific file
 logger = get_logger(__name__, "file_handler.log")
@@ -70,10 +81,15 @@ def write_text_safe(filepath: str, content: str, append: bool = False) -> None:
 # PDF FILE UTILITIES
 # ==========================================
 
-def extract_pdf_text(filepath: str) -> Optional[str]:
+def extract_pdf_text(filepath: str, user_id: Optional[str] = None) -> Optional[str]:
     """
-    Opens a compiled PDF and attempts to extract all readable text.
-    Requires PyPDF2.
+    Opens a compiled PDF and attempts to extract all readable text, plus a
+    highly detailed AI-generated description of every embedded image (above
+    a minimum size, to skip decorative icons/logos) spliced directly after
+    the text of the page it appears on — so diagrams/charts/figures become
+    searchable content instead of silently dropped. `user_id` attributes the
+    vision-LLM token usage for image captions; captioning is skipped
+    entirely if it isn't provided. Requires PyPDF2.
     """
     if PyPDF2 is None:
         raise ImportError("PyPDF2 is not installed")
@@ -83,18 +99,42 @@ def extract_pdf_text(filepath: str) -> Optional[str]:
         return None
 
     extracted_text = []
+    images_captioned = 0
 
     try:
         # 'rb' stands for Read Binary. PDFs are not standard text files!
         with open(filepath, 'rb') as file:
             logger.info(f"Extracting text from PDF: {filepath}")
             reader = PyPDF2.PdfReader(file)
-            
+
             for page_num in range(len(reader.pages)):
                 page = reader.pages[page_num]
+                page_parts = []
+
                 text = page.extract_text()
                 if text:
-                    extracted_text.append(text)
+                    page_parts.append(text)
+
+                # Image captioning is best-effort and page-scoped: a failure
+                # here degrades to text-only for this page rather than
+                # aborting extraction for the whole document.
+                if user_id:
+                    try:
+                        for image_file in page.images:
+                            if images_captioned >= MAX_IMAGES_PER_DOC:
+                                break
+                            if len(image_file.data) < MIN_IMAGE_BYTES:
+                                continue
+
+                            caption = caption_image(image_file.data, image_file.name, user_id)
+                            images_captioned += 1
+                            if caption:
+                                page_parts.append(f"[Image description: {caption}]")
+                    except Exception as e:
+                        logger.warning(f"Failed to process images on page {page_num} of {filepath}: {e}")
+
+                if page_parts:
+                    extracted_text.append("\n\n".join(page_parts))
 
         return sanitize_text("\n\n".join(extracted_text))
         

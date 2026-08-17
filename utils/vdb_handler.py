@@ -71,7 +71,7 @@ def embed_uploaded_file(filepath: str, user_id: str, subject: str, filename: str
         #  Extract Text based on file type
         raw_text = ""
         if filepath.lower().endswith(".pdf"):
-            raw_text = extract_pdf_text(filepath)
+            raw_text = extract_pdf_text(filepath, user_id=user_id)
         elif filepath.lower().endswith(".txt"):
             raw_text = read_text(filepath)
         else:
