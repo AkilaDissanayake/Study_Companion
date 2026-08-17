@@ -80,9 +80,33 @@ class ChatSession(Base):
 
 class QuizRecord(Base):
     __tablename__ = "quizzes"
-    
+
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     session_id = Column(String, ForeignKey("chat_sessions.id",ondelete="CASCADE"))
     user_id = Column(String)
     full_quiz_data = Column(JSON)  # Stores the LLM output (with answers!)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class UserStats(Base):
+    """
+    Non-derivable per-user state for the motivational/gamification layer.
+    Everything else (streak count, quiz totals, avg score, etc.) is computed
+    on read from TokenUsage/ChatSession/QuizRecord — this table only stores
+    what genuinely can't be derived: which milestones the user has already
+    been shown, so a celebration only fires once.
+
+    One row per user, created lazily (get-or-create) on first stats read —
+    this is a brand-new table, not a column added to the existing `users`
+    table, since this app has no migration framework and ALTERs on existing
+    tables are silently never applied by Base.metadata.create_all().
+    """
+    __tablename__ = "user_stats"
+
+    user_id = Column(String, primary_key=True)
+    last_seen_streak_milestone = Column(Integer, default=0, nullable=False)
+    last_seen_badge_ids = Column(ARRAY(String), default=list, nullable=False)
+    timezone = Column(String, nullable=True)  # opportunistic from client; defaults to UTC until set
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)

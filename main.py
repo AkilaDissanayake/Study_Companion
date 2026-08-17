@@ -25,13 +25,14 @@ from utils.json_handler import *
 from utils.file_handler import *
 from utils.vdb_handler import embed_uploaded_file,delete_file_from_vdb,delete_subject_from_vdb
 from utils.database_handler import engine, Base,get_db
-from utils.db_models import TokenUsage, ChatSession, QuizRecord, User
+from utils.db_models import TokenUsage, ChatSession, QuizRecord, User, UserStats
 from utils.response_handler import success_response, raise_api_error
 from utils.database_handler import engine, Base
 from utils import db_models
 from utils.security import hash_password, verify_password, generate_token
 from utils.email_handler import send_verification_email, send_password_reset_email
 from utils.pricing_handler import get_pricing_tiers
+from utils.stats_handler import get_stats_summary, ack_milestone
 from models.chatbot import ChatBot
 from models.quiz_generator import QuizGeneratorAgent
 # Load environment variables (.env)
@@ -152,6 +153,10 @@ class ForgotPasswordRequest(BaseModel):
 class ResetPasswordRequest(BaseModel):
     token: str
     new_password: str
+
+class AckMilestoneRequest(BaseModel):
+    type: str  # "streak" | "badge"
+    id: str
 
 
 # ==========================================
@@ -1102,6 +1107,43 @@ async def delete_quiz(
 
     logger.info(f"Successfully deleted quiz_id: {quiz_id}")
     return success_response(message="Quiz deleted successfully")
+
+
+# ==========================================
+# STATS API (motivational/gamification layer)
+# ==========================================
+
+@app.get("/stats/summary")
+async def get_stats(
+    user_id: str = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """Derived study-streak/quiz/chat/file stats, plus any newly-unlocked
+    streak milestones or badges the frontend should celebrate. Read-only —
+    the get-or-create of the UserStats row is the only write, and it never
+    marks anything as 'seen' (that's /stats/ack's job)."""
+    try:
+        summary = get_stats_summary(db, user_id)
+        return success_response(message="Stats retrieved", data=summary)
+    except Exception as e:
+        logger.exception(f"Failed to compute stats for user {user_id}")
+        raise_api_error(status_code=500, message="Failed to load stats", error_details=e)
+
+
+@app.post("/stats/ack")
+async def acknowledge_milestone(
+    payload: AckMilestoneRequest,
+    user_id: str = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """Marks a streak/badge milestone as seen so it doesn't celebrate again.
+    Call only when the celebration UI actually renders and is dismissed."""
+    try:
+        ack_milestone(db, user_id, payload.type, payload.id)
+        return success_response(message="Milestone acknowledged")
+    except Exception as e:
+        logger.exception(f"Failed to acknowledge milestone for user {user_id}")
+        raise_api_error(status_code=500, message="Failed to acknowledge milestone", error_details=e)
 
 
 # ==========================================
