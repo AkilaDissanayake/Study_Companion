@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import jwt
@@ -8,7 +9,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Response,
 from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from apscheduler.schedulers.background import BackgroundScheduler
 import uvicorn
 from pydantic import BaseModel, EmailStr
@@ -739,68 +740,99 @@ async def delete_user_subject(
 
 @app.post("/chat")
 async def chat_endpoint(
-    request: ChatRequest, 
+    request: ChatRequest,
     user_id: str = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
     """
     Main endpoint that triggers the Adaptive CRAG LangGraph state machine.
+
+    Streams the final answer to the client as Server-Sent Events instead of
+    waiting for the whole graph to finish before responding. Session lookup
+    stays synchronous so a missing/foreign session still 404s immediately,
+    before the stream opens.
     """
-    try:
-        # --- SESSION MANAGEMENT ---
-        if request.session_id:
-            # Fetch existing chat
-            chat_session = db.query(ChatSession).filter(
-                ChatSession.id == request.session_id, 
-                ChatSession.user_id == user_id
-            ).first()
-            
-            if not chat_session:
-                raise HTTPException(status_code=404, detail="Chat session not found")
-        else:
-            # Create a brand new chat
-            chat_session = ChatSession(user_id=user_id, chat_state=[])
-            db.add(chat_session)
-            db.commit()
-            db.refresh(chat_session)
-            
-        # Extract history for LangGraph
-        current_history = chat_session.chat_state 
+    # --- SESSION MANAGEMENT ---
+    if request.session_id:
+        # Fetch existing chat
+        chat_session = db.query(ChatSession).filter(
+            ChatSession.id == request.session_id,
+            ChatSession.user_id == user_id
+        ).first()
 
-        # ---  LANGGRAPH EXECUTION ---
-        logger.debug(f"Invoking LangGraph for user {user_id} with question: {request.raw_question} and session {chat_session.id}")
-        initial_state = {
-            "user_id": user_id,
-            "raw_question": request.raw_question,
-            "chat_history": current_history, # Pass DB history to your agent
-        }
-        
-        final_state =await ChatBot.ainvoke(initial_state)
-        response_text = final_state.get("final_response", "Error: No response generated.")
-        
-        # ---  SAVE NEW MESSAGES TO JSONB ---
-        # Append the new user and AI messages to the history list
-        chat_session.chat_state.append({"role": "user", "content": request.raw_question})
-        chat_session.chat_state.append({"role": "ai", "content": response_text})
-        
-        # SQLAlchemy requires this flag when mutating a JSONB dictionary/list in place
-        logger.debug(f"Updating chat_state for session {chat_session.id} with new messages.")
-        flag_modified(chat_session, "chat_state") 
+        if not chat_session:
+            raise HTTPException(status_code=404, detail="Chat session not found")
+    else:
+        # Create a brand new chat
+        chat_session = ChatSession(user_id=user_id, chat_state=[])
+        db.add(chat_session)
         db.commit()
+        db.refresh(chat_session)
 
-        # ---  RETURN RESPONSE ---
-        chat_data = {
-            "session_id": chat_session.id, # Frontend MUST save this to use on the next prompt
-            "response": response_text,
-            "status": final_state.get("status", "BYPASSED_CRAG"),
-            "used_tools": final_state.get("needs_tools", False)
-        }
-        
-        return success_response(message="Chat generated", data=chat_data)
+    # Extract history for LangGraph
+    current_history = chat_session.chat_state
 
-    except Exception as e:
-        db.rollback()
-        raise_api_error(status_code=500, message="Internal Server Error", error_details=e)
+    logger.debug(f"Streaming LangGraph run for user {user_id} with question: {request.raw_question} and session {chat_session.id}")
+    initial_state = {
+        "user_id": user_id,
+        "raw_question": request.raw_question,
+        "chat_history": current_history, # Pass DB history to your agent
+    }
+
+    async def event_generator():
+        response_chunks: list[str] = []
+        used_tools = False
+        status = "BYPASSED_CRAG"
+
+        try:
+            async for event in ChatBot.astream_events(initial_state, version="v2"):
+                kind = event.get("event")
+
+                # Only the greeting/answer-composer chains are tagged "final_answer" —
+                # these are the only two nodes that ever produce user-facing text.
+                # Everything else (rewriter, classifier, safety, tutor draft, tools)
+                # must never be streamed raw to the client.
+                if kind == "on_chat_model_stream" and "final_answer" in event.get("tags", []):
+                    content = event["data"]["chunk"].content
+                    if content:
+                        response_chunks.append(content)
+                        yield f"data: {json.dumps({'type': 'token', 'content': content})}\n\n"
+
+                elif kind == "on_chain_end" and event.get("name") == "classifier":
+                    used_tools = (event.get("data", {}).get("output") or {}).get("needs_tools", False)
+
+                elif kind == "on_chain_end" and event.get("name") == "grader_node":
+                    status = (event.get("data", {}).get("output") or {}).get("status", status)
+
+            response_text = "".join(response_chunks) or "Error: No response generated."
+
+            # --- SAVE NEW MESSAGES TO JSONB ---
+            chat_session.chat_state.append({"role": "user", "content": request.raw_question})
+            chat_session.chat_state.append({"role": "ai", "content": response_text})
+
+            # SQLAlchemy requires this flag when mutating a JSONB dictionary/list in place
+            logger.debug(f"Updating chat_state for session {chat_session.id} with new messages.")
+            flag_modified(chat_session, "chat_state")
+            db.commit()
+
+            done_payload = {
+                "type": "done",
+                "session_id": chat_session.id, # Frontend MUST save this to use on the next prompt
+                "status": status,
+                "used_tools": used_tools,
+            }
+            yield f"data: {json.dumps(done_payload)}\n\n"
+
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Chat stream failed for session {chat_session.id}: {e}")
+            yield f"data: {json.dumps({'type': 'error', 'message': 'Internal Server Error'})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 @app.get("/chats")
 async def get_user_chats(

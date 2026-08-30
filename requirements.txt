@@ -44,3 +44,8 @@ ddgs
 
 # --- Background tasks ---
 apscheduler
+
+# --- Testing ---
+pytest
+pytest-asyncio
+httpx

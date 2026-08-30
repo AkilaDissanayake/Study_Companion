@@ -175,7 +175,7 @@ async def greeting_node(state: AgentState):
     logger.info(f"Routing to Greeting Node for input: {state.get('rewritten_question')}")
     tracker = TokenTrackingCallbackHandler(state["user_id"], "gpt-4o-mini-greeting")
     
-    chain = GREETING_PROMPT | fast_llm.with_config({"callbacks": [tracker]})
+    chain = GREETING_PROMPT | fast_llm.with_config({"callbacks": [tracker], "tags": ["final_answer"]})
     
     response = await chain.ainvoke({"rewritten_question": state["rewritten_question"]})
     
@@ -370,7 +370,7 @@ async def answer_composer_node(state: AgentState):
     logger.debug(f"Final raw data to compose: {override_data}")
     # Because we use standard URLs now, the fast LLM handles this easily and cheaply.
     tracker = TokenTrackingCallbackHandler(state["user_id"], "fast-composer")
-    chain = COMPOSER_PROMPT | fast_llm.with_config({"callbacks": [tracker]})
+    chain = COMPOSER_PROMPT | fast_llm.with_config({"callbacks": [tracker], "tags": ["final_answer"]})
     
     # Send the raw data directly to the LLM
     response = await chain.ainvoke({
