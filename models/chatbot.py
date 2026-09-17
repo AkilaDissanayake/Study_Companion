@@ -23,12 +23,12 @@ from utils.vdb_handler import search_vdb
 from utils.tools import tools
 from utils.json_handler import read_config
 from utils.prompts import (
-    REWRITER_PROMPT, 
-    CLASSIFIER_PROMPT, 
+    REWRITER_PROMPT,
+    CLASSIFIER_PROMPT,
     SAFETY_PROMPT,
-    GREETING_PROMPT, 
+    GREETING_PROMPT,
     DOMAIN_TUTOR_PROMPT,
-    COMPOSER_PROMPT
+    COMPOSER_PROMPT,
 )
 from utils.token_manager import log_token_usage
 from utils.web_search import search_and_grade_web
@@ -75,7 +75,7 @@ class AgentState(TypedDict):
     needs_documents:bool
     is_safe: bool
     safety_reason: str
-    
+
     # CRAG & Dynamic Context State Variables
     retrieved_chunks: list[str]  
     context: str                 
@@ -115,7 +115,7 @@ async def classify_node(state: AgentState):
     tracker = TokenTrackingCallbackHandler(state["user_id"], "gpt-4o-mini-classifier")
     llm_json = fast_llm.bind(response_format={"type": "json_object"}).with_config({"callbacks": [tracker]})
     chain = CLASSIFIER_PROMPT | llm_json
-    
+
     #Get the subject list
     user_id = state["user_id"]
     config_file = f"{user_id}.json"
@@ -124,21 +124,21 @@ async def classify_node(state: AgentState):
 
     if "General" not in subjects:
         subjects.append("General")
-        
+
     subjects_string = ", ".join(subjects)
     # dynamically pull the names and descriptions of your actual tools!
     if tools:
         tools_desc = "\n".join([f"- {tool.name}: {tool.description}" for tool in tools])
     else:
         tools_desc = "No external tools currently available."
-    
+
     # Inject both the question AND the tool list into the prompt
     response = await chain.ainvoke({
         "rewritten_question": state["rewritten_question"],
         "tools_description": tools_desc,
         "available_subjects": subjects_string
     })
-    
+
     try:
         data = json.loads(response.content)
         logger.debug(f"Classification result: {data}")
@@ -187,15 +187,16 @@ async def retrieval_node(state: AgentState):
     """Pulls formatted context chunks (with sources) from the Vector DB."""
     
     logger.info(f"Retrieving context from Vector DB for question")
-    if state.get("subject") == "General":
-        logger.warning("Subject is 'General'; retrieval may yield broad results.")
-        state["subject"] = "root"  
-        
+    subject = state.get("subject")
+    if subject == "General":
+        logger.info("Subject is 'General'; retrieval may yield broad results.")
+        subject = "root"
+
     # search_vdb now returns the strings PRE-FORMATTED with [Source: filename.pdf]
     res = await asyncio.to_thread(
         search_vdb,
-        user_id=state["user_id"], 
-        subject=state["subject"], 
+        user_id=state["user_id"],
+        subject=subject,
         query=state["rewritten_question"]
     )
     
@@ -269,7 +270,7 @@ async def web_search_node(state: AgentState):
     # NEW: Push the blocking internet request to a background thread!
     formatted_web_data, is_rescued = await asyncio.to_thread(
         search_and_grade_web,
-        query=state["rewritten_question"], 
+        query=state["rewritten_question"],
         grader_model=grader_model
     )
     if state.get("status") == "AMBIGUOUS":
@@ -313,7 +314,7 @@ async def tool_execution_node(state: AgentState): #async put this out of main ev
     logger.info(f"Executing external tools for question: {state['rewritten_question']}")
     tracker = TokenTrackingCallbackHandler(state["user_id"], "gpt-4o-tools")
     llm_with_tools = heavy_llm.bind_tools(tools).with_config({"callbacks": [tracker]})
-    
+
     # Asynchronous LLM call
     response = await llm_with_tools.ainvoke(state["rewritten_question"])
     

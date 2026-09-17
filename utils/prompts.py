@@ -5,8 +5,6 @@ This utilizes system and human messages to create structured instructions for sp
 
 from langchain_core.prompts import ChatPromptTemplate
 
-from langchain_core.prompts import ChatPromptTemplate
-
 # --- Node 1: Question Rewriter ---
 REWRITER_PROMPT = ChatPromptTemplate.from_messages([
     ("system", """You are an intelligent query reformulation assistant for a student study platform.
@@ -46,11 +44,11 @@ ROUTING RULES for 'needs_tools' and 'needs_documents':
 - If the task requires ONLY factual knowledge/theory: needs_tools=false, needs_documents=true (Always set this to true for factual questions to trigger web search fallback).
 - If the task is just conversational chatter ("Hello"): needs_tools=false, needs_documents=false
 
-*** CRITICAL TOOL RULE ***: 
+*** CRITICAL TOOL RULE ***:
 Do NOT set needs_tools to true for theoretical math, writing out mathematical equations, symbolic derivations, or physics proofs (like Einstein or Navier-Stokes). You do not need a tool to write LaTeX. ONLY set needs_tools to true if the user is asking you to compute numerical arithmetic (e.g., 5 * 10) or plot a graph.
 
 You MUST output your response as a strict JSON object with no additional text.
-Format: {{"subject": "string", "detail_level": "detailed" | "concise", "needs_tools": boolean, "needs_documents": boolean}}"""), 
+Format: {{"subject": "string", "detail_level": "detailed" | "concise", "needs_tools": boolean, "needs_documents": boolean}}"""),
     # The actual user input
     ("human", "{rewritten_question}")
 ])
@@ -84,11 +82,11 @@ DOMAIN_TUTOR_PROMPT = ChatPromptTemplate.from_messages([
     {context}
     
     CRITICAL INSTRUCTION:
-    The context provided above contains source tags (e.g., [Source: filename.pdf (Chunk X)] or [Source: https://...]). 
-    Whenever you state a fact derived from the context, you MUST append the exact source tag at the end of the sentence. 
+    The context provided above contains source tags (e.g., [Source: filename.pdf (Chunk X)] or [Source: https://...]).
+    Whenever you state a fact derived from the context, you MUST append the exact source tag at the end of the sentence.
     Do not invent sources."""),
-    
-    ("human", """Please provide a {detail_level} explanation for this {subject} topic: 
+
+    ("human", """Please provide a {detail_level} explanation for this {subject} topic:
     {rewritten_question}""")
 ])
 
